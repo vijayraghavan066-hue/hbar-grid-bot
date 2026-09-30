@@ -1,0 +1,24 @@
+[Unit]
+Description=hbar-grid-bot (HBAR/USD grid trading bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hbarbot
+Group=hbarbot
+WorkingDirectory=/opt/hbar-grid-bot
+EnvironmentFile=/opt/hbar-grid-bot/.env
+ExecStart=/opt/hbar-grid-bot/.venv/bin/python /opt/hbar-grid-bot/bot.py
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/hbar-grid-bot
+
+[Install]
+WantedBy=multi-user.target
