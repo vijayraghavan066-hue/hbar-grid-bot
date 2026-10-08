@@ -102,25 +102,29 @@ class TestIsStuckIdle:
         assert pl._is_stuck_idle(lvl, current_price=0.09, min_notional=0.01) is True
 
 
-class TestNearestLadderName:
+class TestExactLadderMatch:
     def test_exact_match(self):
         cfg = make_cfg()
-        assert pl.nearest_ladder_name(0.04, cfg) == "ladder2"
+        assert pl._exact_ladder_match(0.04, cfg) == "ladder2"
 
-    def test_legacy_offset_maps_to_closest(self):
-        # HBAR's old DENSE_SELL_OFFSET/DENSE_LOW ~ 4.6% -- closer to
-        # ladder2 (4%) than ladder1 (2%) or ladder3 (6%)
+    def test_legacy_offset_matches_nothing(self):
+        # HBAR's old DENSE_SELL_OFFSET/DENSE_LOW ~ 4.6% -- close to
+        # ladder2's 4% but NOT exact, so this must return None (routes to
+        # the even-split path), not "ladder2".
         cfg = make_cfg()
-        assert pl.nearest_ladder_name(0.046, cfg) == "ladder2"
+        assert pl._exact_ladder_match(0.046, cfg) is None
 
-    def test_boundary_rounds_to_nearer_side(self):
+    def test_within_tolerance_still_counts_as_exact(self):
         cfg = make_cfg()
-        assert pl.nearest_ladder_name(0.029, cfg) == "ladder1"  # closer to 2% than 4%
-        assert pl.nearest_ladder_name(0.031, cfg) == "ladder2"  # closer to 4% than 2%
+        assert pl._exact_ladder_match(0.0401, cfg) == "ladder2"  # within OFFSET_TOLERANCE_PCT of 0.04
+
+    def test_boundary_outside_tolerance_matches_nothing(self):
+        cfg = make_cfg()
+        assert pl._exact_ladder_match(0.029, cfg) is None  # 0.9pp off ladder1's 2%, outside tolerance
 
 
 class TestDistributeProfitLadderAware:
-    def test_splits_and_routes_to_owning_ladder(self):
+    def test_exact_match_routes_fully_to_owning_ladder(self):
         cfg = make_cfg()
         state = BotState()
         name = pl.distribute_profit_ladder_aware(state, profit=1.0, sold_offset_pct=0.02, cfg=cfg)
@@ -130,12 +134,36 @@ class TestDistributeProfitLadderAware:
         assert state.pending_reinvest_by_band[pl._band_key(0.02)] == pytest.approx(0.5)
         assert state.total_profit_realized == pytest.approx(1.0)
 
-    def test_other_ladders_untouched(self):
+    def test_exact_match_other_ladders_untouched(self):
         cfg = make_cfg()
         state = BotState()
         pl.distribute_profit_ladder_aware(state, profit=1.0, sold_offset_pct=0.02, cfg=cfg)
         assert state.ladder_reserved.get("ladder2", 0.0) == 0.0
         assert state.ladder_reserved.get("ladder3", 0.0) == 0.0
+
+    def test_legacy_position_splits_evenly_across_all_three(self):
+        # Reproduces the real scenario: the 7 legacy positions whose gap
+        # (~4.6%) is closest to ladder2's 4% but not an exact match must
+        # NOT have their profit funneled entirely into ladder2 -- it splits
+        # evenly across all 3 instead, same fix applied to XRP's 5-ladder
+        # version after it was found there that "nearest ladder" routing
+        # would starve the other ladders.
+        cfg = make_cfg()
+        state = BotState()
+        name = pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg)
+        assert name == "legacy-even-split"
+        for n in range(1, 4):
+            ladder = f"ladder{n}"
+            assert state.ladder_reserved[ladder] == pytest.approx(0.5)  # 3.0/3=1.0 share, 50% reserved
+            assert state.ladder_reserved_contributed[ladder] == pytest.approx(0.5)
+        assert state.total_profit_realized == pytest.approx(3.0)
+
+    def test_legacy_position_queues_pending_reinvest_for_every_ladder(self):
+        cfg = make_cfg()
+        state = BotState()
+        pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg)
+        for _, offset_pct, _, _ in pl.ladder_specs(cfg):
+            assert state.pending_reinvest_by_band[pl._band_key(offset_pct)] == pytest.approx(0.5)
 
     def test_zero_or_negative_profit_is_noop(self):
         cfg = make_cfg()

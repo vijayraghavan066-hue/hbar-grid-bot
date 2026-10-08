@@ -41,44 +41,72 @@ def _band_key(offset_pct: float) -> str:
     return f"{offset_pct:.4f}"
 
 
-def nearest_ladder_name(offset_pct: float, cfg) -> str:
-    """Maps ANY level's own (sell/buy - 1) gap to whichever of the 3
-    ladders its offset is closest to. Needed because the 7 positions
-    already held under the OLD single-dense-zone design (offset ~4.6%,
-    i.e. DENSE_SELL_OFFSET/DENSE_LOW) don't exactly match any of the new
-    ladders' offsets -- when they eventually sell, their profit still
-    needs to go somewhere; "nearest ladder by offset" is the least
-    arbitrary rule available, and the dollar amounts involved are small
-    (~$25 cost basis across all 7) relative to the new structure."""
-    specs = ladder_specs(cfg)
-    return min(specs, key=lambda s: abs(s[1] - offset_pct))[3]
+def _exact_ladder_match(offset_pct: float, cfg):
+    """Which of the 3 ladders a level's own (sell/buy - 1) gap EXACTLY
+    matches (within OFFSET_TOLERANCE_PCT), or None if it matches none of
+    them. A real rung built by reshape_ladder always has a gap matching its
+    own ladder's offset_pct exactly, so this reliably distinguishes "this
+    position IS one of the 3 ladders" from "this is a legacy position held
+    over from whatever design preceded them"."""
+    for _, ladder_offset_pct, _, name in ladder_specs(cfg):
+        if abs(ladder_offset_pct - offset_pct) < OFFSET_TOLERANCE_PCT:
+            return name
+    return None
 
 
 def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float, cfg) -> str:
     """Replaces reinvest.py's distribute_profit for the new ladder system:
-    reserve_ratio of profit goes into the OWNING ladder's own dedicated
-    reserve (never a shared pool), the remainder is queued as that
-    ladder's own pending_reinvest_by_band share, picked up by
-    reshape_ladder's future_pool on its next cycle (reusing the existing
-    gap-filling logic rather than placing orders directly here). Returns
-    the ladder name the profit was attributed to, for logging."""
+    reserve_ratio of profit goes into reserve, the remainder is queued as
+    pending_reinvest_by_band, picked up by reshape_ladder's future_pool on
+    its next cycle (reusing the existing gap-filling logic rather than
+    placing orders directly here).
+
+    A position whose gap EXACTLY matches one of the 3 ladders (a real rung
+    of that ladder) has its ENTIRE profit routed to that one ladder, as
+    always.
+
+    A position whose gap matches NONE of them -- a legacy position held
+    over from the OLD single-dense-zone design (the 7 positions at ~4.6%,
+    i.e. DENSE_SELL_OFFSET/DENSE_LOW, ~$25 cost basis total) -- has its
+    profit SPLIT EVENLY across all 3 ladders instead of funneling to
+    whichever is merely closest (previously ladder2's 4%). Same fix applied
+    to XRP's 5-ladder version 2026-10-08 after it was found there that
+    "nearest ladder" routing would starve the other ladders; applied here
+    on explicit request since the identical mechanism exists for HBAR's own
+    legacy positions, even though the dollar amounts here are small.
+
+    Returns the ladder name profit was routed to (exact-match case), or the
+    literal string "legacy-even-split" (even-split case), for logging."""
     if profit <= 0:
         return ""
-    name = nearest_ladder_name(sold_offset_pct, cfg)
-    reserve_amount = profit * cfg.profit_reserve_ratio
-    distribute_amount = profit - reserve_amount
 
-    state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_amount
-    state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_amount
+    specs = ladder_specs(cfg)
     state.total_profit_realized += profit
+    exact_name = _exact_ladder_match(sold_offset_pct, cfg)
 
-    band_key = _band_key(next(s[1] for s in ladder_specs(cfg) if s[3] == name))
-    state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + distribute_amount
+    if exact_name is not None:
+        reserve_amount = profit * cfg.profit_reserve_ratio
+        distribute_amount = profit - reserve_amount
+        state.ladder_reserved[exact_name] = state.ladder_reserved.get(exact_name, 0.0) + reserve_amount
+        state.ladder_reserved_contributed[exact_name] = state.ladder_reserved_contributed.get(exact_name, 0.0) + reserve_amount
+        band_key = _band_key(sold_offset_pct)
+        state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + distribute_amount
+        log.info(f"pct_ladder: profit {profit:.4f} attributed to {exact_name} (exact offset match) -- "
+                 f"{reserve_amount:.4f} to its own reserve (now ${state.ladder_reserved[exact_name]:.4f}), "
+                 f"{distribute_amount:.4f} queued for its next reshape")
+        return exact_name
 
-    log.info(f"pct_ladder: profit {profit:.4f} attributed to {name} (closest offset match) -- "
-             f"{reserve_amount:.4f} to its own reserve (now ${state.ladder_reserved[name]:.4f}), "
-             f"{distribute_amount:.4f} queued for its next reshape")
-    return name
+    share = profit / len(specs)
+    for _, ladder_offset_pct, _, name in specs:
+        reserve_amount = share * cfg.profit_reserve_ratio
+        distribute_amount = share - reserve_amount
+        state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_amount
+        state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_amount
+        band_key = _band_key(ladder_offset_pct)
+        state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + distribute_amount
+    log.info(f"pct_ladder: profit {profit:.4f} from a legacy position (offset {sold_offset_pct:.4f}, "
+             f"no exact ladder match) -- split evenly across all {len(specs)} ladders (${share:.4f} each before reserve split)")
+    return "legacy-even-split"
 
 
 def ladder_specs(cfg):
