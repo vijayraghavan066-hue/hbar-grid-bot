@@ -294,6 +294,23 @@ class TestReshapeLadder:
         assert n == 0
         assert state.levels == []
         assert state.ladder_reserved["ladder1"] == pytest.approx(5.0)  # drawn, then fully returned -- not lost
+        assert state.ladder_reserved_drawn.get("ladder1", 0.0) == pytest.approx(0.0)  # draw-then-return must not inflate the all-time counter
+
+    def test_repeated_draw_and_return_does_not_inflate_drawn_counter(self):
+        # Reproduces the bug found live 2026-10-08: Ladder 3 had drawn
+        # $3,108 "all-time" against only $5.92 ever contributed, because a
+        # ladder stuck in this draw-then-return loop accumulated the draw
+        # amount every single cycle even though no real capital was ever
+        # actually lost (it's returned right back every time).
+        cfg = make_cfg(reserved_topup_threshold_usd=100.0)
+        state = BotState(levels=[], ladder_reserved={"ladder1": 5.0})
+        trader = FakeTrader()
+        filters = FakeFilters(min_notional=1000.0)
+        for _ in range(20):
+            pl.reshape_ladder(state, "ladder1", lo=0.081, hi=0.09, step_pct=0.01, offset_pct=0.02,
+                               trader=trader, filters=filters, cfg=cfg, current_price=0.09)
+        assert state.ladder_reserved["ladder1"] == pytest.approx(5.0)
+        assert state.ladder_reserved_drawn.get("ladder1", 0.0) == pytest.approx(0.0)
 
 
 class TestMaybeReshapeLadders:

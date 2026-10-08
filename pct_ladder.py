@@ -290,6 +290,16 @@ def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, c
     # reserve to near zero within minutes of normal operation.
     if reserve_draw > 0:
         state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_draw
+        # Undo the ladder_reserved_drawn increment _draw_from_ladder_reserve
+        # just made for this same draw -- otherwise a ladder stuck in this
+        # draw-then-return loop inflates its "all-time drawn" figure by the
+        # same amount every single poll cycle forever, even though no real
+        # capital is actually lost (it's returned right here). Found live
+        # 2026-10-08 on Ladder 3: $3,108 "drawn" against $5.92 ever
+        # contributed, from an extended run of this exact loop. Never driven
+        # below zero -- this exactly reverses the increment from THIS call.
+        state.ladder_reserved_drawn[name] = max(
+            0.0, state.ladder_reserved_drawn.get(name, 0.0) - reserve_draw)
     if future_pool > 0:
         state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + future_pool
     if reserve_draw > 0 or future_pool > 0:
