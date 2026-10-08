@@ -22,6 +22,13 @@ class BotState:
     dense_window_center: float = None  # last DENSE_WINDOW_SNAP-rounded center built around; None = never run yet
     pending_reinvest: float = 0.0  # distribute-share with nowhere eligible to go yet, retried each cycle
     pending_reinvest_since: float = 0.0  # unix ts pending_reinvest started accumulating; 0.0 = none pending
+    # pct_ladder.py: per-ladder state, deliberately SEPARATE pools rather
+    # than one shared reserved_total -- see pct_ladder.py's module
+    # docstring for why (correlated, not diversified, risk within one coin).
+    ladder_reserved: dict = field(default_factory=dict)              # name -> live reserve balance
+    ladder_reserved_contributed: dict = field(default_factory=dict)  # name -> all-time total ever added (never decremented)
+    ladder_reserved_drawn: dict = field(default_factory=dict)        # name -> all-time total ever drawn (never decremented)
+    pending_reinvest_by_band: dict = field(default_factory=dict)     # offset_pct band key -> pending USD, picked up by reshape_ladder's future_pool
 
     def to_dict(self):
         return {
@@ -39,6 +46,10 @@ class BotState:
             "dense_window_center": self.dense_window_center,
             "pending_reinvest": self.pending_reinvest,
             "pending_reinvest_since": self.pending_reinvest_since,
+            "ladder_reserved": self.ladder_reserved,
+            "ladder_reserved_contributed": self.ladder_reserved_contributed,
+            "ladder_reserved_drawn": self.ladder_reserved_drawn,
+            "pending_reinvest_by_band": self.pending_reinvest_by_band,
         }
 
     @staticmethod
@@ -60,6 +71,10 @@ class BotState:
             dense_window_center=d.get("dense_window_center"),
             pending_reinvest=d.get("pending_reinvest", 0.0),
             pending_reinvest_since=d.get("pending_reinvest_since", 0.0),
+            ladder_reserved=d.get("ladder_reserved", {}),
+            ladder_reserved_contributed=d.get("ladder_reserved_contributed", {}),
+            ladder_reserved_drawn=d.get("ladder_reserved_drawn", {}),
+            pending_reinvest_by_band=d.get("pending_reinvest_by_band", {}),
         )
 
 

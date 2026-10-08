@@ -11,6 +11,7 @@ from dense_window import maybe_shift_dense_window
 from grid import GridLevel, build_bulk_ladder_levels, build_hybrid_zoned_levels, build_zoned_levels
 from health import write_heartbeat
 from ledger import log_buy_fill, log_sell_fill
+from pct_ladder import distribute_profit_ladder_aware, ladder_specs, maybe_reshape_ladders
 from reinvest import distribute_profit, retry_pending_reinvest
 from sell_fanout import merge_same_price_buys, merge_same_price_sells, place_fanout
 from state import BotState, load_state, save_state
@@ -332,12 +333,16 @@ def run():
                             lvl.buy_order_id = None
                             lvl.sell_order_id = None
                             lvl.qty = 0.0
-                            distribute_profit(state, profit, current_price,
-                                               cfg.profit_reserve_ratio, trader, filters,
-                                               cfg.taker_avoidance_buffer,
-                                               dense_sell_offset=cfg.dense_sell_offset,
-                                               reinvest_band_pct=cfg.reinvest_band_pct,
-                                               near_market_band_pct=cfg.near_market_band_pct)
+                            if cfg.pct_ladder_enabled and not lvl.one_shot:
+                                sold_offset_pct = (lvl.sell_price / lvl.buy_price - 1.0) if lvl.buy_price else 0.0
+                                distribute_profit_ladder_aware(state, profit, sold_offset_pct, cfg)
+                            else:
+                                distribute_profit(state, profit, current_price,
+                                                   cfg.profit_reserve_ratio, trader, filters,
+                                                   cfg.taker_avoidance_buffer,
+                                                   dense_sell_offset=cfg.dense_sell_offset,
+                                                   reinvest_band_pct=cfg.reinvest_band_pct,
+                                                   near_market_band_pct=cfg.near_market_band_pct)
 
                 for lvl in levels_to_remove:
                     state.levels.remove(lvl)
@@ -360,6 +365,8 @@ def run():
                     maybe_shift_zones(state, current_price, trader, filters, cfg)
 
                 maybe_shift_dense_window(state, current_price, trader, filters, cfg)
+
+                maybe_reshape_ladders(state, current_price, trader, filters, cfg)
 
                 apply_order_window(state, current_price, trader, filters, cfg.max_open_orders,
                                     cfg.taker_avoidance_buffer, halted=halted)
@@ -389,6 +396,11 @@ def run():
                 "dense_window_enabled": cfg.dense_window_enabled,
                 "dense_window_center": state.dense_window_center,
                 "dense_window_half_width": cfg.dense_window_half_width,
+                "pct_ladder_enabled": cfg.pct_ladder_enabled,
+                "pct_ladder_specs": [
+                    {"name": name, "step_pct": step_pct, "offset_pct": offset_pct, "window_pct": window_pct}
+                    for step_pct, offset_pct, window_pct, name in ladder_specs(cfg)
+                ] if cfg.pct_ladder_enabled else [],
             })
             time.sleep(cfg.poll_interval_seconds)
 

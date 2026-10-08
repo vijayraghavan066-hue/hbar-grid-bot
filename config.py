@@ -52,6 +52,20 @@ class Config:
     dense_window_enabled: bool
     dense_window_half_width: float
     dense_window_snap: float
+    # pct_ladder.py: percentage-based 3-ladder system (see that module's
+    # docstring). step/offset/window are fractions (0.01 = 1%).
+    pct_ladder_enabled: bool
+    ladder1_step_pct: float
+    ladder1_offset_pct: float
+    ladder1_window_pct: float
+    ladder2_step_pct: float
+    ladder2_offset_pct: float
+    ladder2_window_pct: float
+    ladder3_step_pct: float
+    ladder3_offset_pct: float
+    ladder3_window_pct: float
+    reserved_draw_floor_pct: float      # each draw capped so a ladder's own reserve never drops below this fraction of itself
+    reserved_topup_threshold_usd: float  # a ladder's own (idle+buy_open) capital below this triggers an auto top-up from its reserve
     dry_run: bool
     profit_reserve_ratio: float
     reinvest_band_pct: float
@@ -97,6 +111,18 @@ def load_config() -> Config:
         dense_window_enabled=_get_bool("DENSE_WINDOW_ENABLED", False),
         dense_window_half_width=float(_get("DENSE_WINDOW_HALF_WIDTH", "0.35")),
         dense_window_snap=float(_get("DENSE_WINDOW_SNAP", "0.05")),
+        pct_ladder_enabled=_get_bool("PCT_LADDER_ENABLED", False),
+        ladder1_step_pct=float(_get("LADDER1_STEP_PCT", "0.01")),
+        ladder1_offset_pct=float(_get("LADDER1_OFFSET_PCT", "0.02")),
+        ladder1_window_pct=float(_get("LADDER1_WINDOW_PCT", "0.10")),
+        ladder2_step_pct=float(_get("LADDER2_STEP_PCT", "0.02")),
+        ladder2_offset_pct=float(_get("LADDER2_OFFSET_PCT", "0.04")),
+        ladder2_window_pct=float(_get("LADDER2_WINDOW_PCT", "0.20")),
+        ladder3_step_pct=float(_get("LADDER3_STEP_PCT", "0.03")),
+        ladder3_offset_pct=float(_get("LADDER3_OFFSET_PCT", "0.06")),
+        ladder3_window_pct=float(_get("LADDER3_WINDOW_PCT", "0.30")),
+        reserved_draw_floor_pct=float(_get("RESERVED_DRAW_FLOOR_PCT", "0.5")),
+        reserved_topup_threshold_usd=float(_get("RESERVED_TOPUP_THRESHOLD_USD", "20.0")),
         dry_run=_get_bool("DRY_RUN", True),
         profit_reserve_ratio=float(_get("PROFIT_RESERVE_RATIO", "0.5")),
         reinvest_band_pct=float(_get("REINVEST_BAND_PCT", "0.04")),
@@ -156,5 +182,15 @@ def load_config() -> Config:
         raise RuntimeError("DENSE_WINDOW_HALF_WIDTH must be positive")
     if cfg.dense_window_snap <= 0:
         raise RuntimeError("DENSE_WINDOW_SNAP must be positive")
+    for name in ("ladder1_step_pct", "ladder1_offset_pct", "ladder1_window_pct",
+                 "ladder2_step_pct", "ladder2_offset_pct", "ladder2_window_pct",
+                 "ladder3_step_pct", "ladder3_offset_pct", "ladder3_window_pct"):
+        val = getattr(cfg, name)
+        if not (0.0 < val < 1.0):
+            raise RuntimeError(f"{name.upper()} must be between 0 and 1 (e.g. 0.02 for 2%), got {val}")
+    if not (0.0 <= cfg.reserved_draw_floor_pct <= 1.0):
+        raise RuntimeError("RESERVED_DRAW_FLOOR_PCT must be between 0 and 1")
+    if cfg.reserved_topup_threshold_usd < 0:
+        raise RuntimeError("RESERVED_TOPUP_THRESHOLD_USD must be zero or positive")
 
     return cfg
