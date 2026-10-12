@@ -64,6 +64,12 @@ class Config:
     ladder3_step_pct: float
     ladder3_offset_pct: float
     ladder3_window_pct: float
+    ladder4_step_pct: float
+    ladder4_offset_pct: float
+    ladder4_window_pct: float
+    ladder5_step_pct: float
+    ladder5_offset_pct: float
+    ladder5_window_pct: float
     reserved_draw_floor_pct: float      # each draw capped so a ladder's own reserve never drops below this fraction of itself
     reserved_topup_threshold_usd: float  # a ladder's own (idle+buy_open) capital below this triggers an auto top-up from its reserve
     dry_run: bool
@@ -121,6 +127,12 @@ def load_config() -> Config:
         ladder3_step_pct=float(_get("LADDER3_STEP_PCT", "0.03")),
         ladder3_offset_pct=float(_get("LADDER3_OFFSET_PCT", "0.06")),
         ladder3_window_pct=float(_get("LADDER3_WINDOW_PCT", "0.30")),
+        ladder4_step_pct=float(_get("LADDER4_STEP_PCT", "0.04")),
+        ladder4_offset_pct=float(_get("LADDER4_OFFSET_PCT", "0.08")),
+        ladder4_window_pct=float(_get("LADDER4_WINDOW_PCT", "0.40")),
+        ladder5_step_pct=float(_get("LADDER5_STEP_PCT", "0.05")),
+        ladder5_offset_pct=float(_get("LADDER5_OFFSET_PCT", "0.10")),
+        ladder5_window_pct=float(_get("LADDER5_WINDOW_PCT", "0.50")),
         reserved_draw_floor_pct=float(_get("RESERVED_DRAW_FLOOR_PCT", "0.5")),
         reserved_topup_threshold_usd=float(_get("RESERVED_TOPUP_THRESHOLD_USD", "20.0")),
         dry_run=_get_bool("DRY_RUN", True),
@@ -184,7 +196,9 @@ def load_config() -> Config:
         raise RuntimeError("DENSE_WINDOW_SNAP must be positive")
     for name in ("ladder1_step_pct", "ladder1_offset_pct", "ladder1_window_pct",
                  "ladder2_step_pct", "ladder2_offset_pct", "ladder2_window_pct",
-                 "ladder3_step_pct", "ladder3_offset_pct", "ladder3_window_pct"):
+                 "ladder3_step_pct", "ladder3_offset_pct", "ladder3_window_pct",
+                 "ladder4_step_pct", "ladder4_offset_pct", "ladder4_window_pct",
+                 "ladder5_step_pct", "ladder5_offset_pct", "ladder5_window_pct"):
         val = getattr(cfg, name)
         if not (0.0 < val < 1.0):
             raise RuntimeError(f"{name.upper()} must be between 0 and 1 (e.g. 0.02 for 2%), got {val}")

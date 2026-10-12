@@ -16,6 +16,8 @@ def make_cfg(**overrides):
         ladder1_step_pct=0.01, ladder1_offset_pct=0.02, ladder1_window_pct=0.10,
         ladder2_step_pct=0.02, ladder2_offset_pct=0.04, ladder2_window_pct=0.20,
         ladder3_step_pct=0.03, ladder3_offset_pct=0.06, ladder3_window_pct=0.30,
+        ladder4_step_pct=0.04, ladder4_offset_pct=0.08, ladder4_window_pct=0.40,
+        ladder5_step_pct=0.05, ladder5_offset_pct=0.10, ladder5_window_pct=0.50,
         reserved_draw_floor_pct=0.5, reserved_topup_threshold_usd=20.0,
         reference_price=0.09, dca_exponent=1.0, profit_reserve_ratio=0.5,
         pct_ladder_enabled=True,
@@ -141,21 +143,21 @@ class TestDistributeProfitLadderAware:
         assert state.ladder_reserved.get("ladder2", 0.0) == 0.0
         assert state.ladder_reserved.get("ladder3", 0.0) == 0.0
 
-    def test_legacy_position_splits_evenly_across_all_three(self):
-        # Reproduces the real scenario: the 7 legacy positions whose gap
-        # (~4.6%) is closest to ladder2's 4% but not an exact match must
-        # NOT have their profit funneled entirely into ladder2 -- it splits
-        # evenly across all 3 instead, same fix applied to XRP's 5-ladder
-        # version after it was found there that "nearest ladder" routing
-        # would starve the other ladders.
+    def test_legacy_position_splits_evenly_across_all_five(self):
+        # Reproduces the real scenario: legacy positions whose gap is
+        # closest to one ladder's offset but not an exact match must NOT
+        # have their profit funneled entirely into that one ladder -- it
+        # splits evenly across all 5 instead (HBAR extended to 5 ladders
+        # 2026-10-11, matching XRP/UNI, after "nearest ladder" routing was
+        # found there to starve the other ladders).
         cfg = make_cfg()
         state = BotState()
         name = pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg)
         assert name == "legacy-even-split"
-        for n in range(1, 4):
+        for n in range(1, 6):
             ladder = f"ladder{n}"
-            assert state.ladder_reserved[ladder] == pytest.approx(0.5)  # 3.0/3=1.0 share, 50% reserved
-            assert state.ladder_reserved_contributed[ladder] == pytest.approx(0.5)
+            assert state.ladder_reserved[ladder] == pytest.approx(0.3)  # 3.0/5=0.6 share, 50% reserved
+            assert state.ladder_reserved_contributed[ladder] == pytest.approx(0.3)
         assert state.total_profit_realized == pytest.approx(3.0)
 
     def test_legacy_position_queues_pending_reinvest_for_every_ladder(self):
@@ -163,7 +165,7 @@ class TestDistributeProfitLadderAware:
         state = BotState()
         pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg)
         for _, offset_pct, _, _ in pl.ladder_specs(cfg):
-            assert state.pending_reinvest_by_band[pl._band_key(offset_pct)] == pytest.approx(0.5)
+            assert state.pending_reinvest_by_band[pl._band_key(offset_pct)] == pytest.approx(0.3)
 
     def test_zero_or_negative_profit_is_noop(self):
         cfg = make_cfg()
@@ -323,6 +325,27 @@ class TestReshapeLadder:
         assert state.levels == []
         assert state.ladder_reserved["ladder1"] == pytest.approx(5.0)  # drawn, then fully returned -- not lost
         assert state.ladder_reserved_drawn.get("ladder1", 0.0) == pytest.approx(0.0)  # draw-then-return must not inflate the all-time counter
+
+    def test_mismatched_level_collected_alone_is_not_discarded(self):
+        # Reproduces the bug found live 2026-10-12: cancelling a single
+        # out-of-window level (no reserve draw, no future-buy pool involved)
+        # whose collected capital then cannot clear min_notional and has no
+        # survivor to grow was being silently discarded -- not refunded to
+        # ladder_reserved, not logged, just gone from the ladder's own books
+        # even though the real money was never actually lost (the order never
+        # filled, so the exchange released it back to free balance on cancel).
+        cfg = make_cfg(reserved_topup_threshold_usd=100.0)
+        stale = GridLevel(index=0, buy_price=1.00, sell_price=1.00 * 1.01, base_qty=20.0,
+                           state="buy_open", buy_order_id="abc")
+        state = BotState(levels=[stale], ladder_reserved={"ladder1": 0.0})
+        trader = FakeTrader()
+        filters = FakeFilters(min_notional=1000.0)  # impossibly high -- nothing can ever clear this
+        n = pl.reshape_ladder(state, "ladder1", lo=1.33, hi=1.40, step_pct=0.01, offset_pct=0.01,
+                               trader=trader, filters=filters, cfg=cfg, current_price=1.40)
+        assert n == 0
+        assert state.levels == []  # the stale out-of-window level was cancelled and removed
+        assert state.ladder_reserved["ladder1"] == pytest.approx(20.0)  # collected capital landed in reserve, not lost
+        assert "abc" in trader.cancelled
 
     def test_repeated_draw_and_return_does_not_inflate_drawn_counter(self):
         # Reproduces the bug found live 2026-10-08: Ladder 3 had drawn

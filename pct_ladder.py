@@ -110,13 +110,15 @@ def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float,
 
 
 def ladder_specs(cfg):
-    """(step_pct, offset_pct, window_pct, name) for ladders 1-3, in order.
+    """(step_pct, offset_pct, window_pct, name) for ladders 1-5, in order.
     step_pct/offset_pct/window_pct are fractions (0.01 = 1%), not percent
     points, matching this project's existing _pct config convention."""
     return [
         (cfg.ladder1_step_pct, cfg.ladder1_offset_pct, cfg.ladder1_window_pct, "ladder1"),
         (cfg.ladder2_step_pct, cfg.ladder2_offset_pct, cfg.ladder2_window_pct, "ladder2"),
         (cfg.ladder3_step_pct, cfg.ladder3_offset_pct, cfg.ladder3_window_pct, "ladder3"),
+        (cfg.ladder4_step_pct, cfg.ladder4_offset_pct, cfg.ladder4_window_pct, "ladder4"),
+        (cfg.ladder5_step_pct, cfg.ladder5_offset_pct, cfg.ladder5_window_pct, "ladder5"),
     ]
 
 
@@ -269,7 +271,8 @@ def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, c
     if mismatched and not collected and future_pool <= 0 and reserve_draw <= 0:
         return 0
 
-    total_capital = sum(l.target_qty() * l.buy_price for l in collected) + future_pool + reserve_draw
+    collected_capital = sum(l.target_qty() * l.buy_price for l in collected)
+    total_capital = collected_capital + future_pool + reserve_draw
     if future_pool > 0:
         state.pending_reinvest_by_band[band_key] = 0.0
     for lvl in collected:
@@ -328,9 +331,11 @@ def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, c
         # below zero -- this exactly reverses the increment from THIS call.
         state.ladder_reserved_drawn[name] = max(
             0.0, state.ladder_reserved_drawn.get(name, 0.0) - reserve_draw)
+    if collected_capital > 0:
+        state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + collected_capital
     if future_pool > 0:
         state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + future_pool
-    if reserve_draw > 0 or future_pool > 0:
+    if reserve_draw > 0 or future_pool > 0 or collected_capital > 0:
         log.info(f"pct_ladder: {name} drew ${total_capital:.4f} but had nothing viable to build "
                  f"or grow -- returned to its own reserve/pending pool untouched")
     return 0

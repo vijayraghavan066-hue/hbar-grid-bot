@@ -2,5 +2,14 @@
 state.json
 logs/
 __pycache__/
+.pytest_cache/
 *.pyc
 .venv/
+trades.csv
+consolidation_log.csv
+heartbeat.json
+order_health.json
+*.csv
+*.bak*
+*.before_*
+*_snapshot.json
