@@ -208,6 +208,25 @@ class TestDrawFromLadderReserve:
         pl._draw_from_ladder_reserve(state, cfg, "ladder1")
         assert state.ladder_reserved_drawn["ladder1"] == pytest.approx(5.0 + 2.5)
 
+    def test_already_negligible_reserve_snaps_to_zero_without_drawing(self):
+        # Reproduces the infinite no-op loop found live 2026-10-13: a
+        # long-dry ladder's reserve decayed (via repeated floor-capped
+        # draws' geometric decay) down to subatomic float dust (1e-96,
+        # 1e-210 seen on DASH/HBAR) that never reaches exactly zero,
+        # triggering a no-op reshape every single poll cycle forever.
+        cfg = make_cfg(reserved_draw_floor_pct=0.5)
+        state = BotState(ladder_reserved={"ladder1": 1e-96})
+        draw = pl._draw_from_ladder_reserve(state, cfg, "ladder1")
+        assert draw == 0.0
+        assert state.ladder_reserved["ladder1"] == 0.0  # snapped, not left as dust
+
+    def test_draw_that_would_leave_negligible_dust_takes_it_all_instead(self):
+        cfg = make_cfg(reserved_draw_floor_pct=0.5)
+        state = BotState(ladder_reserved={"ladder1": 2e-6})  # floor-capped remainder would be 1e-6 dust
+        draw = pl._draw_from_ladder_reserve(state, cfg, "ladder1")
+        assert state.ladder_reserved["ladder1"] == 0.0  # no dust left behind
+        assert state.ladder_reserved_drawn["ladder1"] == pytest.approx(draw)
+
 
 class TestReshapeLadder:
     def test_builds_fresh_levels_filling_the_window(self):

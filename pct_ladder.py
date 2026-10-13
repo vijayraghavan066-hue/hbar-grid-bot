@@ -36,6 +36,13 @@ log = logging.getLogger("hbar-grid-bot")
 
 OFFSET_TOLERANCE_PCT = 0.0005  # 0.05 percentage points -- float-safe matching of a level's own gap to its ladder's offset_pct
 
+# Below this, a ladder's reserve is treated as fully exhausted rather than
+# left to the floor-capped draw's geometric decay toward (never reaching)
+# zero -- found live 2026-10-13: left unchecked, a long-dry ladder's reserve
+# can decay to subatomic float dust (1e-96, 1e-210 seen on DASH/HBAR) and
+# keep triggering a no-op reshape every single poll cycle forever.
+_NEGLIGIBLE_RESERVE_USD = 1e-6
+
 
 def _band_key(offset_pct: float) -> str:
     """Stable dict key for a percentage offset, e.g. 0.02 -> '0.0200'."""
@@ -188,14 +195,17 @@ def _draw_from_ladder_reserve(state, cfg, name, max_amount=None, ignore_floor=Fa
     reserve. Escaping that dead end takes priority over the normal
     retention floor."""
     available = state.ladder_reserved.get(name, 0.0)
-    if available <= 0:
+    if available <= _NEGLIGIBLE_RESERVE_USD:
+        if available > 0:
+            state.ladder_reserved[name] = 0.0  # snap dust to exactly zero, stop the decay loop for good
         return 0.0
     drawable = available if ignore_floor else available * (1.0 - cfg.reserved_draw_floor_pct)
     draw = min(drawable, max_amount) if max_amount is not None else drawable
     draw = max(0.0, draw)
     if draw <= 0:
         return 0.0
-    state.ladder_reserved[name] = available - draw
+    remainder = available - draw
+    state.ladder_reserved[name] = 0.0 if remainder <= _NEGLIGIBLE_RESERVE_USD else remainder
     state.ladder_reserved_drawn[name] = state.ladder_reserved_drawn.get(name, 0.0) + draw
     return draw
 
