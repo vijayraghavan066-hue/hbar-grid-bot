@@ -173,17 +173,23 @@ def _is_stuck_idle(lvl, current_price, min_notional):
     return 0 < notional < min_notional
 
 
-def _draw_from_ladder_reserve(state, cfg, name, max_amount=None):
+def _draw_from_ladder_reserve(state, cfg, name, max_amount=None, ignore_floor=False):
     """Draws from state.ladder_reserved[name] -- THIS ladder's own pool
     only, never another ladder's. Capped so the pool never drops below
     reserved_draw_floor_pct of its OWN value at the moment of THIS draw
     (geometric decay toward, never reaching, zero across repeated draws
     during a sustained decline) -- same safety property as DASH's shared-
-    pool version, just scoped per ladder now."""
+    pool version, just scoped per ladder now -- UNLESS ignore_floor=True,
+    used only for the completely-dry emergency-bootstrap case in
+    reshape_ladder: a ladder that can never place a single order can also
+    never earn the profit that would replenish its own reserve, so it
+    stays stuck at zero rungs forever regardless of how much sits in
+    reserve. Escaping that dead end takes priority over the normal
+    retention floor."""
     available = state.ladder_reserved.get(name, 0.0)
     if available <= 0:
         return 0.0
-    drawable = available * (1.0 - cfg.reserved_draw_floor_pct)
+    drawable = available if ignore_floor else available * (1.0 - cfg.reserved_draw_floor_pct)
     draw = min(drawable, max_amount) if max_amount is not None else drawable
     draw = max(0.0, draw)
     if draw <= 0:
@@ -191,6 +197,23 @@ def _draw_from_ladder_reserve(state, cfg, name, max_amount=None):
     state.ladder_reserved[name] = available - draw
     state.ladder_reserved_drawn[name] = state.ladder_reserved_drawn.get(name, 0.0) + draw
     return draw
+
+
+def _min_capital_for_one_level(lo, hi, step_pct, reference_price, dca_exponent, min_notional):
+    """Smallest total_capital that would let the single best (highest-DCA-
+    weight) point in this window clear min_notional, under the same
+    weighting _dca_build_levels uses. Lets reshape_ladder tell, before
+    drawing anything, whether the normal floor-capped reserve draw would
+    be enough to escape a completely-dry ladder, or whether this specific
+    bootstrap needs to draw past the floor -- see _draw_from_ladder_reserve's
+    ignore_floor."""
+    points = build_ladder_points(lo, hi, step_pct)
+    if not points:
+        return float("inf")
+    weights = [(reference_price / p) ** dca_exponent for p in points]
+    best_weight = max(weights)
+    total_weight = sum(weights)
+    return min_notional * total_weight / best_weight
 
 
 def _dca_build_levels(points, total_capital, reference_price, dca_exponent, offset_pct, filters, start_index):
@@ -253,10 +276,27 @@ def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, c
     reserve_draw = 0.0
     if future_pool <= 0:
         if not same_ladder:
-            reserve_draw = _draw_from_ladder_reserve(state, cfg, name)
-            if reserve_draw > 0:
-                log.warning(f"pct_ladder: {name} is completely dry -- drew ${reserve_draw:.4f} "
-                            f"from its own reserve (${state.ladder_reserved.get(name, 0.0):.4f} remaining)")
+            available = state.ladder_reserved.get(name, 0.0)
+            needed_min = _min_capital_for_one_level(lo, hi, step_pct, cfg.reference_price,
+                                                      cfg.dca_exponent, filters.min_notional)
+            normal_preview = available * (1.0 - cfg.reserved_draw_floor_pct)
+            if normal_preview < needed_min <= available:
+                # The normal floor-respecting draw would leave this ladder
+                # stuck at zero rungs indefinitely (it can never earn the
+                # profit that would replenish its own reserve while dry),
+                # but the full reserve would be enough to place one real
+                # order -- bootstrap takes priority over retention here.
+                reserve_draw = _draw_from_ladder_reserve(state, cfg, name, ignore_floor=True)
+                if reserve_draw > 0:
+                    log.warning(f"pct_ladder: {name} emergency bootstrap -- the normal floor-capped "
+                                f"draw (${normal_preview:.4f}) wasn't enough to place a single order "
+                                f"(needs ${needed_min:.4f}); drew the full remaining reserve "
+                                f"(${reserve_draw:.4f}) instead of staying stuck at zero rungs")
+            else:
+                reserve_draw = _draw_from_ladder_reserve(state, cfg, name)
+                if reserve_draw > 0:
+                    log.warning(f"pct_ladder: {name} is completely dry -- drew ${reserve_draw:.4f} "
+                                f"from its own reserve (${state.ladder_reserved.get(name, 0.0):.4f} remaining)")
         elif own_capital < cfg.reserved_topup_threshold_usd:
             needed = cfg.reserved_topup_threshold_usd - own_capital
             reserve_draw = _draw_from_ladder_reserve(state, cfg, name, max_amount=needed)

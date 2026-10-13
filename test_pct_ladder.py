@@ -326,6 +326,68 @@ class TestReshapeLadder:
         assert state.ladder_reserved["ladder1"] == pytest.approx(5.0)  # drawn, then fully returned -- not lost
         assert state.ladder_reserved_drawn.get("ladder1", 0.0) == pytest.approx(0.0)  # draw-then-return must not inflate the all-time counter
 
+    def test_completely_dry_bypasses_retention_floor_when_only_full_reserve_is_enough(self):
+        # The normal floor-capped draw (reserved_draw_floor_pct) can leave a
+        # completely dry ladder permanently stuck at zero rungs even with
+        # real money sitting in its own reserve, because a dry ladder earns
+        # no profit of its own to ever grow past that point -- found live
+        # 2026-10-12 across XRP/UNI/ZEC/HBAR (manually fixed each time by
+        # injecting fresh capital). When the FULL reserve -- not just the
+        # floor-capped share -- would be enough to place one real order,
+        # escaping zero rungs takes priority over the normal retention floor.
+        cfg = make_cfg(reserved_topup_threshold_usd=100.0, reserved_draw_floor_pct=0.5)
+        filters = FakeFilters(min_notional=1.0)
+        needed_min = pl._min_capital_for_one_level(lo=1.33, hi=1.40, step_pct=0.01,
+                                                     reference_price=cfg.reference_price,
+                                                     dca_exponent=cfg.dca_exponent,
+                                                     min_notional=filters.min_notional)
+        reserve = needed_min + 0.50  # 50% of this is NOT enough; 100% is
+        assert reserve * 0.5 < needed_min  # sanity: confirms the scenario is real
+        state = BotState(levels=[], ladder_reserved={"ladder1": reserve})
+        trader = FakeTrader()
+        n = pl.reshape_ladder(state, "ladder1", lo=1.33, hi=1.40, step_pct=0.01, offset_pct=0.01,
+                               trader=trader, filters=filters, cfg=cfg, current_price=1.40)
+        assert n > 0  # at least one real rung got built, not left stuck at zero
+        assert all(lvl.state == "idle" for lvl in state.levels)
+        assert state.ladder_reserved.get("ladder1", 0.0) < reserve  # the bypass draw actually happened
+
+    def test_completely_dry_still_respects_floor_when_capped_draw_is_already_enough(self):
+        # In the common, healthy case -- the floor-capped draw alone already
+        # clears min_notional -- the bypass must NOT fire. The retention
+        # floor only gets overridden as a last resort, never routinely.
+        cfg = make_cfg(reserved_topup_threshold_usd=100.0, reserved_draw_floor_pct=0.5)
+        filters = FakeFilters(min_notional=1.0)
+        needed_min = pl._min_capital_for_one_level(lo=1.33, hi=1.40, step_pct=0.01,
+                                                     reference_price=cfg.reference_price,
+                                                     dca_exponent=cfg.dca_exponent,
+                                                     min_notional=filters.min_notional)
+        reserve = needed_min * 3  # comfortably more than enough even at 50%
+        state = BotState(levels=[], ladder_reserved={"ladder1": reserve})
+        trader = FakeTrader()
+        n = pl.reshape_ladder(state, "ladder1", lo=1.33, hi=1.40, step_pct=0.01, offset_pct=0.01,
+                               trader=trader, filters=filters, cfg=cfg, current_price=1.40)
+        assert n > 0
+        assert state.ladder_reserved.get("ladder1", 0.0) >= reserve * 0.5 - 0.01
+
+    def test_completely_dry_gracefully_stays_dry_when_even_full_reserve_isnt_enough(self):
+        # If even 100% of the reserve would not clear min_notional, there is
+        # nothing the bootstrap override can do -- falls back to the existing
+        # graceful behavior (capital returned, never lost, ladder stays dry
+        # until real outside capital arrives).
+        cfg = make_cfg(reserved_topup_threshold_usd=100.0, reserved_draw_floor_pct=0.5)
+        filters = FakeFilters(min_notional=1.0)
+        needed_min = pl._min_capital_for_one_level(lo=1.33, hi=1.40, step_pct=0.01,
+                                                     reference_price=cfg.reference_price,
+                                                     dca_exponent=cfg.dca_exponent,
+                                                     min_notional=filters.min_notional)
+        reserve = needed_min * 0.1  # nowhere near enough even at 100%
+        state = BotState(levels=[], ladder_reserved={"ladder1": reserve})
+        trader = FakeTrader()
+        n = pl.reshape_ladder(state, "ladder1", lo=1.33, hi=1.40, step_pct=0.01, offset_pct=0.01,
+                               trader=trader, filters=filters, cfg=cfg, current_price=1.40)
+        assert n == 0
+        assert state.ladder_reserved.get("ladder1", 0.0) == pytest.approx(reserve)
+
     def test_mismatched_level_collected_alone_is_not_discarded(self):
         # Reproduces the bug found live 2026-10-12: cancelling a single
         # out-of-window level (no reserve draw, no future-buy pool involved)
