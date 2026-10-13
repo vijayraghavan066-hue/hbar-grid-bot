@@ -388,6 +388,52 @@ class TestReshapeLadder:
         assert n == 0
         assert state.ladder_reserved.get("ladder1", 0.0) == pytest.approx(reserve)
 
+    def test_growing_existing_levels_records_per_rung_reinvest_note(self):
+        # Per-rung lifetime tracking: when reshape_ladder grows SURVIVING
+        # levels instead of building fresh ones (window already fully
+        # covered -- every geometric point already has a survivor), that
+        # specific rung should carry a record of what just got reinvested
+        # into it -- shown on the dashboard as a "reinvested" note next to
+        # that exact price.
+        cfg = make_cfg(reserved_topup_threshold_usd=0.0)
+        lo, hi, step_pct = 1.33, 1.36, 0.01
+        points = pl.build_ladder_points(lo, hi, step_pct)
+        survivors = [GridLevel(index=i, buy_price=p, sell_price=round(p * 1.01, 10), base_qty=10.0,
+                                state="idle") for i, p in enumerate(points)]
+        state = BotState(levels=list(survivors),
+                          pending_reinvest_by_band={pl._band_key(0.01): 2.0})
+        trader = FakeTrader()
+        filters = FakeFilters(min_notional=1.0)
+        n = pl.reshape_ladder(state, "ladder1", lo=lo, hi=hi, step_pct=step_pct, offset_pct=0.01,
+                               trader=trader, filters=filters, cfg=cfg, current_price=1.36)
+        assert n == 0  # grew survivors, didn't build fresh levels (window already fully covered)
+        expected_per_level = 2.0 / len(survivors)
+        for lvl in survivors:
+            assert lvl.extra_qty > 0
+            assert lvl.last_reinvest_usd == pytest.approx(expected_per_level)
+            assert lvl.last_reinvest_ts > 0
+        # A level this function never touches keeps its reinvest fields untouched.
+        untouched = GridLevel(index=99, buy_price=0.50, sell_price=0.50 * 1.05, base_qty=5.0, state="idle")
+        assert untouched.last_reinvest_usd == 0.0
+        assert untouched.last_reinvest_ts == 0.0
+
+    def test_fresh_gap_fill_levels_start_with_no_reinvest_history(self):
+        # A brand-new rung built to fill a genuine window gap is NOT the
+        # same thing as reinvesting into an existing one -- it should start
+        # with zero lifetime profit and no reinvest note, not inherit
+        # anything from the capital that funded it.
+        cfg = make_cfg(reserved_topup_threshold_usd=0.0)
+        state = BotState(levels=[], pending_reinvest_by_band={pl._band_key(0.01): 50.0})
+        trader = FakeTrader()
+        filters = FakeFilters(min_notional=1.0)
+        n = pl.reshape_ladder(state, "ladder1", lo=1.33, hi=1.36, step_pct=0.01, offset_pct=0.01,
+                               trader=trader, filters=filters, cfg=cfg, current_price=1.36)
+        assert n > 0
+        for lvl in state.levels:
+            assert lvl.lifetime_profit == 0.0
+            assert lvl.last_reinvest_usd == 0.0
+            assert lvl.last_reinvest_ts == 0.0
+
     def test_mismatched_level_collected_alone_is_not_discarded(self):
         # Reproduces the bug found live 2026-10-12: cancelling a single
         # out-of-window level (no reserve draw, no future-buy pool involved)

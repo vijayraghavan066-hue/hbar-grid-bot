@@ -28,6 +28,7 @@ falls toward it.
 """
 import logging
 import math
+import time
 
 from zone_shift import _cancel_and_collect
 
@@ -345,9 +346,12 @@ def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, c
 
     if matching:
         per_level = total_capital / len(matching)
+        now = time.time()
         for lvl in matching:
             extra_qty = per_level / lvl.buy_price
             lvl.extra_qty += extra_qty
+            lvl.last_reinvest_usd = per_level
+            lvl.last_reinvest_ts = now
         log.info(f"pct_ladder: {name} reshaped {len(collected)} level(s) by growing {len(matching)} "
                  f"existing level(s) (${total_capital:.4f} added, window already fully covered)")
         return 0

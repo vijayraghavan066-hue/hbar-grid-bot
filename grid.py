@@ -16,6 +16,14 @@ class GridLevel:
     qty: float = 0.0  # actual qty of the currently open/filled order
     one_shot: bool = False  # bulk-ladder levels: never re-arm a buy after selling
     consolidated: bool = False  # already merged into a coarse far-from-market level
+    # Per-rung history, persists across buy/sell cycles on the SAME object
+    # (a ladder-native rung keeps its identity: sell -> idle -> re-armed
+    # buy_open is all one GridLevel, see bot.py's sell-fill handler) --
+    # only resets if this exact price point ever falls out of its ladder's
+    # window and gets collected/rebuilt as a fresh level by reshape_ladder.
+    lifetime_profit: float = 0.0   # sum of every sell fill's profit this specific rung has ever had
+    last_reinvest_usd: float = 0.0  # $ most recently added to this rung's extra_qty by reshape_ladder
+    last_reinvest_ts: float = 0.0   # unix ts of that reinvestment; 0.0 = never
 
     def target_qty(self) -> float:
         return self.base_qty + self.extra_qty
@@ -33,6 +41,9 @@ class GridLevel:
             "qty": self.qty,
             "one_shot": self.one_shot,
             "consolidated": self.consolidated,
+            "lifetime_profit": self.lifetime_profit,
+            "last_reinvest_usd": self.last_reinvest_usd,
+            "last_reinvest_ts": self.last_reinvest_ts,
         }
 
     @staticmethod

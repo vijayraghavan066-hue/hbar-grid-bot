@@ -322,6 +322,7 @@ def run():
                     elif lvl.state == "sell_open":
                         if trader.is_filled(lvl.sell_order_id, current_price):
                             profit = (lvl.sell_price - lvl.buy_price) * lvl.qty
+                            lvl.lifetime_profit += profit
                             log.info(f"Grid {lvl.index} (${lvl.buy_price}): SELL filled "
                                       f"qty={lvl.qty} profit={profit:.4f} USDT"
                                       + (" [one_shot, closing for good]" if lvl.one_shot else ""))
