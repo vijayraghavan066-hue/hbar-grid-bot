@@ -399,6 +399,62 @@ def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, c
     return 0
 
 
+EXTEND_BATCH_SIZE = 10  # how many new points below current coverage to consider per cycle --
+# bounded so DCA weighting (which favors cheaper points) can't skip the nearest gap to fund a
+# far-cheaper one instead; same reasoning every other point list in this module already relies
+# on being geometrically local. Explicit example figure from the 2026-10-15 request.
+
+
+def extend_ladder_coverage(state, name, step_pct, offset_pct, cfg, filters):
+    """As a ladder's own reserve grows, proactively extends real buy-side
+    coverage DOWNWARD past whatever its lowest rung has ever reached,
+    toward cfg.anchor_low -- independent of the current sliding window,
+    and never touching or rebuilding any existing rung (2026-10-15,
+    explicit request: every rung from a ladder's lowest point up to
+    current price should eventually carry a real order, funded only by
+    that ladder's own reserve as it accrues, never by moving capital out
+    of rungs that already exist). Works in bounded batches of up to
+    EXTEND_BATCH_SIZE points, starting right where the last batch left
+    off, so later cycles keep inching the floor down as reserve regrows."""
+    existing = [lvl for lvl in state.levels
+                if not lvl.one_shot and lvl.state in ("idle", "buy_open", "sell_open")
+                and abs((lvl.sell_price / lvl.buy_price - 1.0) - offset_pct) < OFFSET_TOLERANCE_PCT]
+    if not existing:
+        return 0  # nothing built yet for this ladder -- reshape_ladder's own bootstrap handles that first
+    lowest = min(lvl.buy_price for lvl in existing)
+    if lowest <= cfg.anchor_low:
+        return 0  # already reached the floor
+
+    new_points = []
+    p = lowest / (1.0 + step_pct)
+    while p >= cfg.anchor_low and len(new_points) < EXTEND_BATCH_SIZE:
+        new_points.append(round(p, 10))
+        p = p / (1.0 + step_pct)
+    if not new_points:
+        return 0
+
+    reserve_draw = _draw_from_ladder_reserve(state, cfg, name)
+    if reserve_draw <= 0:
+        return 0
+
+    thinned = _thin_to_affordable(new_points, reserve_draw, cfg.reference_price, cfg.dca_exponent, filters.min_notional)
+    fresh = _dca_build_levels(thinned, reserve_draw, cfg.reference_price, cfg.dca_exponent,
+                               offset_pct, filters, state.next_level_index)
+    if not fresh:
+        # Too thin to build anything real this cycle -- return the draw
+        # untouched rather than losing it (same undo pattern reshape_ladder
+        # uses for its own no-op branch).
+        state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_draw
+        state.ladder_reserved_drawn[name] = max(0.0, state.ladder_reserved_drawn.get(name, 0.0) - reserve_draw)
+        return 0
+
+    state.next_level_index += len(fresh)
+    state.levels.extend(fresh)
+    log.info(f"pct_ladder: {name} extended coverage downward with {len(fresh)} new rung(s) "
+             f"(${reserve_draw:.4f} from reserve), lowest now ${min(l.buy_price for l in fresh):.6f}")
+    return len(fresh)
+
+
 def maybe_reshape_ladders(state, current_price, trader, filters, cfg):
     """Runs every poll cycle, same as DASH's maybe_reshape_ladders.
     Deliberately NOT gated on price having moved -- a ladder can get
@@ -414,4 +470,5 @@ def maybe_reshape_ladders(state, current_price, trader, filters, cfg):
         if hi <= lo:
             continue
         total_reshaped += reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, cfg, current_price)
+        total_reshaped += extend_ladder_coverage(state, name, step_pct, offset_pct, cfg, filters)
     return total_reshaped

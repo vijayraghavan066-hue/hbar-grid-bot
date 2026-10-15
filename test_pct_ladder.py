@@ -511,6 +511,67 @@ class TestReshapeLadder:
         assert state.ladder_reserved_drawn.get("ladder1", 0.0) == pytest.approx(0.0)
 
 
+class TestExtendLadderCoverage:
+    def test_no_existing_levels_is_a_noop(self):
+        # A ladder with nothing built yet is reshape_ladder's own bootstrap
+        # job, not this function's -- extending downward from nothing
+        # isn't meaningful.
+        cfg = make_cfg()
+        state = BotState(levels=[], ladder_reserved={"ladder1": 100.0})
+        n = pl.extend_ladder_coverage(state, "ladder1", step_pct=0.01, offset_pct=0.02,
+                                       cfg=cfg, filters=FakeFilters(min_notional=1.0))
+        assert n == 0
+        assert state.levels == []
+        assert state.ladder_reserved["ladder1"] == pytest.approx(100.0)  # untouched, no draw happened
+
+    def test_already_at_anchor_low_is_a_noop(self):
+        cfg = make_cfg(anchor_low=0.08)
+        existing = GridLevel(index=0, buy_price=0.08, sell_price=0.08 * 1.02, base_qty=10.0, state="sell_open")
+        state = BotState(levels=[existing], ladder_reserved={"ladder1": 100.0})
+        n = pl.extend_ladder_coverage(state, "ladder1", step_pct=0.01, offset_pct=0.02,
+                                       cfg=cfg, filters=FakeFilters(min_notional=1.0))
+        assert n == 0
+        assert state.levels == [existing]
+        assert state.ladder_reserved["ladder1"] == pytest.approx(100.0)
+
+    def test_builds_new_rungs_below_the_existing_lowest(self):
+        cfg = make_cfg(anchor_low=0.02)
+        existing = GridLevel(index=0, buy_price=0.085, sell_price=0.085 * 1.02, base_qty=10.0, state="sell_open")
+        state = BotState(levels=[existing], ladder_reserved={"ladder1": 50.0})
+        n = pl.extend_ladder_coverage(state, "ladder1", step_pct=0.01, offset_pct=0.02,
+                                       cfg=cfg, filters=FakeFilters(min_notional=1.0))
+        assert n > 0
+        new_levels = [lvl for lvl in state.levels if lvl is not existing]
+        assert len(new_levels) == n
+        for lvl in new_levels:
+            assert lvl.buy_price < existing.buy_price  # strictly below the old lowest, never rebuilding it
+            assert lvl.state == "idle"
+        # Reserve floor-respecting draw: half of the 50.0 available.
+        assert state.ladder_reserved["ladder1"] == pytest.approx(25.0)
+
+    def test_batch_is_capped_even_with_abundant_capital(self):
+        # Huge reserve and a far-away floor shouldn't build past
+        # EXTEND_BATCH_SIZE rungs in a single cycle -- later cycles keep
+        # inching the floor down instead of jumping straight to it.
+        cfg = make_cfg(anchor_low=0.001, reserved_draw_floor_pct=0.5)
+        existing = GridLevel(index=0, buy_price=1.0, sell_price=1.0 * 1.02, base_qty=10.0, state="sell_open")
+        state = BotState(levels=[existing], ladder_reserved={"ladder1": 1_000_000.0})
+        n = pl.extend_ladder_coverage(state, "ladder1", step_pct=0.01, offset_pct=0.02,
+                                       cfg=cfg, filters=FakeFilters(min_notional=1.0))
+        assert n == pl.EXTEND_BATCH_SIZE
+
+    def test_nothing_buildable_returns_the_draw_untouched(self):
+        cfg = make_cfg(reserved_topup_threshold_usd=100.0, anchor_low=0.02)
+        existing = GridLevel(index=0, buy_price=0.085, sell_price=0.085 * 1.02, base_qty=10.0, state="sell_open")
+        state = BotState(levels=[existing], ladder_reserved={"ladder1": 50.0})
+        filters = FakeFilters(min_notional=100000.0)  # impossibly high -- nothing can ever clear this
+        n = pl.extend_ladder_coverage(state, "ladder1", step_pct=0.01, offset_pct=0.02, cfg=cfg, filters=filters)
+        assert n == 0
+        assert state.levels == [existing]  # nothing added
+        assert state.ladder_reserved["ladder1"] == pytest.approx(50.0)  # draw undone, not lost
+        assert state.ladder_reserved_drawn.get("ladder1", 0.0) == pytest.approx(0.0)
+
+
 class TestMaybeReshapeLadders:
     def test_disabled_flag_is_a_full_noop(self):
         cfg = make_cfg(pct_ladder_enabled=False)
