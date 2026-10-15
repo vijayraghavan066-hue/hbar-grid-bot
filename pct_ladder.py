@@ -264,19 +264,22 @@ def _thin_to_affordable(points, total_capital, reference_price, dca_exponent, mi
 
 
 def reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, cfg, current_price):
-    """Cancels any idle/buy_open level belonging to THIS ladder (matched
-    by its own (sell_price/buy_price - 1) gap vs offset_pct) that no
-    longer belongs in the current window or is structurally stuck, pools
-    that capital with this ladder's own future-buy pool and any reserve
-    draw, fills genuine gaps in the window first, and only grows existing
-    survivors once the window is fully covered. Held (sell_open) and any
-    one_shot levels are never inspected -- a cancel failure (already
+    """Fills genuine gaps in the current window using this ladder's own
+    future-buy pool and reserve draw, then (only once the window is fully
+    covered) grows existing survivors. A real resting order (buy_open), once
+    live, is NEVER cancelled just because the window has since drifted past
+    it (2026-10-15, explicit request: coverage should only ever grow, never
+    churn -- a rung earned its spot, the window moving on doesn't evict it).
+    The only levels ever collected are ones that were never real orders to
+    begin with: idle levels that are structurally stuck (would cross the
+    spread as a taker, or have decayed below min_notional). Held (sell_open)
+    and any one_shot levels are never inspected -- a cancel failure (already
     filled for real) leaves that level completely untouched."""
     band_key = _band_key(offset_pct)
     future_pool = state.pending_reinvest_by_band.get(band_key, 0.0)
 
     def needs_reshaping(lvl):
-        return not _in_range(lvl.buy_price, lo, hi) or _is_stuck_idle(lvl, current_price, filters.min_notional)
+        return _is_stuck_idle(lvl, current_price, filters.min_notional)
 
     same_ladder = [lvl for lvl in state.levels
                    if not lvl.one_shot and lvl.state in ("idle", "buy_open")

@@ -453,26 +453,46 @@ class TestReshapeLadder:
             assert lvl.last_reinvest_usd == 0.0
             assert lvl.last_reinvest_ts == 0.0
 
-    def test_mismatched_level_collected_alone_is_not_discarded(self):
-        # Reproduces the bug found live 2026-10-12: cancelling a single
-        # out-of-window level (no reserve draw, no future-buy pool involved)
-        # whose collected capital then cannot clear min_notional and has no
-        # survivor to grow was being silently discarded -- not refunded to
-        # ladder_reserved, not logged, just gone from the ladder's own books
-        # even though the real money was never actually lost (the order never
-        # filled, so the exchange released it back to free balance on cancel).
-        cfg = make_cfg(reserved_topup_threshold_usd=100.0)
+    def test_out_of_window_buy_open_level_is_never_cancelled(self):
+        # 2026-10-15, explicit request: a real resting order, once live,
+        # should never be cancelled just because the window has since
+        # drifted past it -- coverage should only ever grow, funded from
+        # the ladder's own reserve, never by uprooting existing orders.
+        # A buy_open level far outside [lo, hi] must survive reshape
+        # completely untouched: still in state.levels, never cancelled.
+        cfg = make_cfg(reserved_topup_threshold_usd=0.0)
         stale = GridLevel(index=0, buy_price=1.00, sell_price=1.00 * 1.01, base_qty=20.0,
                            state="buy_open", buy_order_id="abc")
         state = BotState(levels=[stale], ladder_reserved={"ladder1": 0.0})
+        trader = FakeTrader()
+        filters = FakeFilters(min_notional=1.0)
+        n = pl.reshape_ladder(state, "ladder1", lo=1.33, hi=1.40, step_pct=0.01, offset_pct=0.01,
+                               trader=trader, filters=filters, cfg=cfg, current_price=1.40)
+        assert n == 0
+        assert state.levels == [stale]  # untouched -- never collected, never cancelled
+        assert trader.cancelled == []
+
+    def test_stuck_idle_level_collected_alone_is_not_discarded(self):
+        # Reproduces the bug found live 2026-10-12, now via the only path
+        # that can still collect a level: a genuinely stuck IDLE level
+        # (never a real order) whose collected capital then cannot clear
+        # min_notional and has no survivor to grow was being silently
+        # discarded -- not refunded to ladder_reserved, not logged, just
+        # gone from the ladder's own books, even though no real order (and
+        # therefore no real money) was ever placed.
+        cfg = make_cfg(reserved_topup_threshold_usd=100.0)
+        # buy_price >= current_price makes this idle level structurally
+        # stuck (would cross the spread as a taker) -- the only remaining
+        # trigger inside needs_reshaping.
+        stuck = GridLevel(index=0, buy_price=1.40, sell_price=1.40 * 1.01, base_qty=20.0, state="idle")
+        state = BotState(levels=[stuck], ladder_reserved={"ladder1": 0.0})
         trader = FakeTrader()
         filters = FakeFilters(min_notional=1000.0)  # impossibly high -- nothing can ever clear this
         n = pl.reshape_ladder(state, "ladder1", lo=1.33, hi=1.40, step_pct=0.01, offset_pct=0.01,
                                trader=trader, filters=filters, cfg=cfg, current_price=1.40)
         assert n == 0
-        assert state.levels == []  # the stale out-of-window level was cancelled and removed
-        assert state.ladder_reserved["ladder1"] == pytest.approx(20.0)  # collected capital landed in reserve, not lost
-        assert "abc" in trader.cancelled
+        assert state.levels == []  # the stuck idle level was collected and removed
+        assert state.ladder_reserved["ladder1"] == pytest.approx(28.0)  # collected capital landed in reserve, not lost
 
     def test_repeated_draw_and_return_does_not_inflate_drawn_counter(self):
         # Reproduces the bug found live 2026-10-08: Ladder 3 had drawn
