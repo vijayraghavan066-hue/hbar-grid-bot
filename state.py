@@ -9,6 +9,12 @@ from grid import GridLevel
 @dataclass
 class BotState:
     levels: list = field(default_factory=list)  # list[GridLevel]
+    # Bot-wide accumulation (cfg.accum_ratio of every sale's profit, via
+    # _split_profit_four_ways) -- NOT the "shared drawable reserve" the
+    # pct_ladder.py module docstring warns against below. Nothing ever
+    # draws this back out; it is a one-way savings total, separate in
+    # purpose from ladder_reserved below (which stays per-ladder and
+    # auto-drawable).
     reserved_total: float = 0.0
     total_profit_realized: float = 0.0
     config_signature: dict = field(default_factory=dict)
@@ -29,6 +35,18 @@ class BotState:
     ladder_reserved_contributed: dict = field(default_factory=dict)  # name -> all-time total ever added (never decremented)
     ladder_reserved_drawn: dict = field(default_factory=dict)        # name -> all-time total ever drawn (never decremented)
     pending_reinvest_by_band: dict = field(default_factory=dict)     # offset_pct band key -> pending USD, picked up by reshape_ladder's future_pool
+    # pct_ladder.py: standing per-ladder coin reserve (replenish_coin_reserve
+    # grows it from a slice of every sale's profit; maybe_fund_sell_from_reserve
+    # draws it when a ladder has zero live sells, listing it as a real sell
+    # order). Unlike every other reserve field here, this one holds HBAR
+    # units, not USD.
+    coin_reserve_qty: dict = field(default_factory=dict)         # name -> HBAR units held, unlisted
+    coin_reserve_cost_basis: dict = field(default_factory=dict)  # name -> $ paid per unit at (re)seed time
+    # _grow_coin_reserve: a single sale's coin-reserve slice is usually
+    # far too small to clear min_notional on its own -- accumulates here
+    # per ladder across sales instead of being discarded back to buy-side
+    # every time, until the running total is big enough to actually buy.
+    pending_coin_growth: dict = field(default_factory=dict)      # name -> USD accumulated, not yet converted to coin
 
     def to_dict(self):
         return {
@@ -50,6 +68,9 @@ class BotState:
             "ladder_reserved_contributed": self.ladder_reserved_contributed,
             "ladder_reserved_drawn": self.ladder_reserved_drawn,
             "pending_reinvest_by_band": self.pending_reinvest_by_band,
+            "coin_reserve_qty": self.coin_reserve_qty,
+            "coin_reserve_cost_basis": self.coin_reserve_cost_basis,
+            "pending_coin_growth": self.pending_coin_growth,
         }
 
     @staticmethod
@@ -75,6 +96,9 @@ class BotState:
             ladder_reserved_contributed=d.get("ladder_reserved_contributed", {}),
             ladder_reserved_drawn=d.get("ladder_reserved_drawn", {}),
             pending_reinvest_by_band=d.get("pending_reinvest_by_band", {}),
+            coin_reserve_qty=d.get("coin_reserve_qty", {}),
+            coin_reserve_cost_basis=d.get("coin_reserve_cost_basis", {}),
+            pending_coin_growth=d.get("pending_coin_growth", {}),
         )
 
 

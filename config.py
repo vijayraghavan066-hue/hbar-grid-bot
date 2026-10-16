@@ -72,6 +72,16 @@ class Config:
     ladder5_window_pct: float
     reserved_draw_floor_pct: float      # each draw capped so a ladder's own reserve never drops below this fraction of itself
     reserved_topup_threshold_usd: float  # a ladder's own (idle+buy_open) capital below this triggers an auto top-up from its reserve
+    # Every ladder-native sale's profit splits 4 ways (must sum to 1.0) --
+    # see pct_ladder.py's _split_profit_four_ways. accum_ratio is the only
+    # one of the four never auto-drawn by anything; ladder_reserve_ratio
+    # keeps today's auto-top-up behavior (_draw_from_ladder_reserve)
+    # unchanged. profit_reserve_ratio below is unrelated -- kept only for
+    # the non-ladder-aware distribute_profit() fallback path.
+    accum_ratio: float
+    compound_ratio: float
+    ladder_reserve_ratio: float
+    coin_reserve_ratio: float
     dry_run: bool
     profit_reserve_ratio: float
     reinvest_band_pct: float
@@ -135,6 +145,10 @@ def load_config() -> Config:
         ladder5_window_pct=float(_get("LADDER5_WINDOW_PCT", "0.50")),
         reserved_draw_floor_pct=float(_get("RESERVED_DRAW_FLOOR_PCT", "0.5")),
         reserved_topup_threshold_usd=float(_get("RESERVED_TOPUP_THRESHOLD_USD", "20.0")),
+        accum_ratio=float(_get("ACCUM_RATIO", "0.25")),
+        compound_ratio=float(_get("COMPOUND_RATIO", "0.25")),
+        ladder_reserve_ratio=float(_get("LADDER_RESERVE_RATIO", "0.25")),
+        coin_reserve_ratio=float(_get("COIN_RESERVE_RATIO", "0.25")),
         dry_run=_get_bool("DRY_RUN", True),
         profit_reserve_ratio=float(_get("PROFIT_RESERVE_RATIO", "0.5")),
         reinvest_band_pct=float(_get("REINVEST_BAND_PCT", "0.04")),
@@ -206,5 +220,14 @@ def load_config() -> Config:
         raise RuntimeError("RESERVED_DRAW_FLOOR_PCT must be between 0 and 1")
     if cfg.reserved_topup_threshold_usd < 0:
         raise RuntimeError("RESERVED_TOPUP_THRESHOLD_USD must be zero or positive")
+    for name in ("accum_ratio", "compound_ratio", "ladder_reserve_ratio", "coin_reserve_ratio"):
+        val = getattr(cfg, name)
+        if not (0.0 <= val <= 1.0):
+            raise RuntimeError(f"{name.upper()} must be between 0 and 1, got {val}")
+    four_way_total = (cfg.accum_ratio + cfg.compound_ratio
+                       + cfg.ladder_reserve_ratio + cfg.coin_reserve_ratio)
+    if abs(four_way_total - 1.0) > 1e-6:
+        raise RuntimeError("ACCUM_RATIO + COMPOUND_RATIO + LADDER_RESERVE_RATIO + "
+                            f"COIN_RESERVE_RATIO must sum to 1.0, got {four_way_total}")
 
     return cfg

@@ -24,6 +24,14 @@ class GridLevel:
     lifetime_profit: float = 0.0   # sum of every sell fill's profit this specific rung has ever had
     last_reinvest_usd: float = 0.0  # $ most recently added to this rung's extra_qty by reshape_ladder
     last_reinvest_ts: float = 0.0   # unix ts of that reinvestment; 0.0 = never
+    # pct_ladder.py's coin reserve: True for a sell order built from a
+    # ladder's coin_reserve_qty by maybe_fund_sell_from_reserve rather than
+    # from a normal buy fill. coin_reserve_ladder records which ladder it
+    # belongs to explicitly, since the taker-avoidance floor there can make
+    # this level's own sell/buy gap land wider than that ladder's exact
+    # offset_pct -- see liquidate_coin_reserve_position's docstring.
+    from_coin_reserve: bool = False
+    coin_reserve_ladder: Optional[str] = None
 
     def target_qty(self) -> float:
         return self.base_qty + self.extra_qty
@@ -44,6 +52,8 @@ class GridLevel:
             "lifetime_profit": self.lifetime_profit,
             "last_reinvest_usd": self.last_reinvest_usd,
             "last_reinvest_ts": self.last_reinvest_ts,
+            "from_coin_reserve": self.from_coin_reserve,
+            "coin_reserve_ladder": self.coin_reserve_ladder,
         }
 
     @staticmethod

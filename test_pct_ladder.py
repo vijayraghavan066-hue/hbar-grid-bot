@@ -20,21 +20,50 @@ def make_cfg(**overrides):
         ladder5_step_pct=0.05, ladder5_offset_pct=0.10, ladder5_window_pct=0.50,
         reserved_draw_floor_pct=0.5, reserved_topup_threshold_usd=20.0,
         reference_price=0.09, dca_exponent=1.0, profit_reserve_ratio=0.5,
-        pct_ladder_enabled=True,
+        pct_ladder_enabled=True, taker_avoidance_buffer=0.0005,
+        # Every ladder-native sale's profit splits 4 ways (must sum to 1.0)
+        # -- accumulation (never drawn), buy-side compounding, ladder
+        # reserve (still auto-drawable), coin reserve. Equal 25% default,
+        # same as live.
+        accum_ratio=0.25, compound_ratio=0.25,
+        ladder_reserve_ratio=0.25, coin_reserve_ratio=0.25,
     )
     base.update(overrides)
     return type("Cfg", (), base)()
 
 
 class FakeTrader:
-    def __init__(self, fail_cancel_ids=None):
+    def __init__(self, fail_cancel_ids=None, price=0.09, fail_buy=False, fail_sell=False):
         self.cancelled = []
         self.fail_cancel_ids = fail_cancel_ids or set()
+        self.price = price
+        self.fail_buy = fail_buy
+        self.fail_sell = fail_sell
+        self.placed_buys = []   # list[(price, qty)]
+        self.placed_sells = []  # list[(price, qty)]
+        self._next_id = 0
 
     def cancel_order(self, order_id):
         if order_id in self.fail_cancel_ids:
             raise RuntimeError("already filled")
         self.cancelled.append(order_id)
+
+    def get_price(self):
+        return self.price
+
+    def place_limit_buy(self, price, qty):
+        if self.fail_buy:
+            raise RuntimeError("buy rejected")
+        self.placed_buys.append((price, qty))
+        self._next_id += 1
+        return f"buy-{self._next_id}"
+
+    def place_limit_sell(self, price, qty):
+        if self.fail_sell:
+            raise RuntimeError("sell rejected")
+        self.placed_sells.append((price, qty))
+        self._next_id += 1
+        return f"sell-{self._next_id}"
 
 
 class FakeFilters:
@@ -43,6 +72,9 @@ class FakeFilters:
 
     def round_qty(self, qty):
         return round(qty, 6)
+
+    def round_price(self, price):
+        return round(price, 6)
 
 
 class TestBuildLadderPoints:
@@ -129,17 +161,22 @@ class TestDistributeProfitLadderAware:
     def test_exact_match_routes_fully_to_owning_ladder(self):
         cfg = make_cfg()
         state = BotState()
-        name = pl.distribute_profit_ladder_aware(state, profit=1.0, sold_offset_pct=0.02, cfg=cfg)
+        trader, filters = FakeTrader(), FakeFilters()
+        name = pl.distribute_profit_ladder_aware(state, profit=1.0, sold_offset_pct=0.02, cfg=cfg,
+                                                   trader=trader, filters=filters)
         assert name == "ladder1"
-        assert state.ladder_reserved["ladder1"] == pytest.approx(0.5)
-        assert state.ladder_reserved_contributed["ladder1"] == pytest.approx(0.5)
-        assert state.pending_reinvest_by_band[pl._band_key(0.02)] == pytest.approx(0.5)
+        assert state.ladder_reserved["ladder1"] == pytest.approx(0.25)
+        assert state.ladder_reserved_contributed["ladder1"] == pytest.approx(0.25)
+        assert state.pending_reinvest_by_band[pl._band_key(0.02)] == pytest.approx(0.25)
+        assert state.reserved_total == pytest.approx(0.25)
         assert state.total_profit_realized == pytest.approx(1.0)
 
     def test_exact_match_other_ladders_untouched(self):
         cfg = make_cfg()
         state = BotState()
-        pl.distribute_profit_ladder_aware(state, profit=1.0, sold_offset_pct=0.02, cfg=cfg)
+        trader, filters = FakeTrader(), FakeFilters()
+        pl.distribute_profit_ladder_aware(state, profit=1.0, sold_offset_pct=0.02, cfg=cfg,
+                                            trader=trader, filters=filters)
         assert state.ladder_reserved.get("ladder2", 0.0) == 0.0
         assert state.ladder_reserved.get("ladder3", 0.0) == 0.0
 
@@ -152,25 +189,31 @@ class TestDistributeProfitLadderAware:
         # found there to starve the other ladders).
         cfg = make_cfg()
         state = BotState()
-        name = pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg)
+        trader, filters = FakeTrader(), FakeFilters()
+        name = pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg,
+                                                   trader=trader, filters=filters)
         assert name == "legacy-even-split"
         for n in range(1, 6):
             ladder = f"ladder{n}"
-            assert state.ladder_reserved[ladder] == pytest.approx(0.3)  # 3.0/5=0.6 share, 50% reserved
-            assert state.ladder_reserved_contributed[ladder] == pytest.approx(0.3)
+            assert state.ladder_reserved[ladder] == pytest.approx(0.15)  # 3.0/5=0.6 share, 25% to ladder reserve
+            assert state.ladder_reserved_contributed[ladder] == pytest.approx(0.15)
         assert state.total_profit_realized == pytest.approx(3.0)
 
     def test_legacy_position_queues_pending_reinvest_for_every_ladder(self):
         cfg = make_cfg()
         state = BotState()
-        pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg)
+        trader, filters = FakeTrader(), FakeFilters()
+        pl.distribute_profit_ladder_aware(state, profit=3.0, sold_offset_pct=0.046, cfg=cfg,
+                                            trader=trader, filters=filters)
         for _, offset_pct, _, _ in pl.ladder_specs(cfg):
-            assert state.pending_reinvest_by_band[pl._band_key(offset_pct)] == pytest.approx(0.3)
+            assert state.pending_reinvest_by_band[pl._band_key(offset_pct)] == pytest.approx(0.15)
 
     def test_zero_or_negative_profit_is_noop(self):
         cfg = make_cfg()
         state = BotState()
-        pl.distribute_profit_ladder_aware(state, profit=0.0, sold_offset_pct=0.02, cfg=cfg)
+        trader, filters = FakeTrader(), FakeFilters()
+        pl.distribute_profit_ladder_aware(state, profit=0.0, sold_offset_pct=0.02, cfg=cfg,
+                                            trader=trader, filters=filters)
         assert state.ladder_reserved == {}
         assert state.total_profit_realized == 0.0
 
@@ -590,3 +633,228 @@ class TestMaybeReshapeLadders:
         assert round(0.02, 4) in gaps
         assert round(0.04, 4) in gaps
         assert round(0.06, 4) in gaps
+
+
+class TestGrowCoinReserve:
+    """_grow_coin_reserve takes an already-sized coin amount directly -- the
+    splitting decision (how much of a sale's profit is coin-eligible) is
+    made by _split_profit_four_ways, tested separately below."""
+
+    def test_buys_coin_with_the_given_amount(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=0.01)
+        pl._grow_coin_reserve(state, "ladder2", 0.10, trader, filters, cfg)
+        assert state.coin_reserve_qty["ladder2"] > 0
+        assert state.pending_coin_growth.get("ladder2", 0.0) == pytest.approx(0.0)
+
+    def test_growth_grows_an_already_nonzero_reserve_with_weighted_avg_cost_basis(self):
+        cfg = make_cfg()
+        state = BotState(coin_reserve_qty={"ladder2": 100.0}, coin_reserve_cost_basis={"ladder2": 0.08})
+        trader, filters = FakeTrader(price=0.12), FakeFilters(min_notional=0.01)  # buy at a different price
+        pl._grow_coin_reserve(state, "ladder2", 1.0, trader, filters, cfg)
+        new_qty = state.coin_reserve_qty["ladder2"]
+        assert new_qty > 100.0  # grew, didn't just overwrite
+        assert 0.08 < state.coin_reserve_cost_basis["ladder2"] < 0.1203
+
+    def test_failed_growth_buy_accumulates_in_pending_coin_growth_not_lost(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09, fail_buy=True), FakeFilters(min_notional=0.01)
+        pl._grow_coin_reserve(state, "ladder2", 0.10, trader, filters, cfg)
+        assert state.coin_reserve_qty.get("ladder2", 0.0) == 0.0
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(0.10)  # waiting, not lost
+
+    def test_too_thin_amount_accumulates_in_pending_coin_growth(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=1000.0)
+        pl._grow_coin_reserve(state, "ladder2", 0.10, trader, filters, cfg)
+        assert state.coin_reserve_qty.get("ladder2", 0.0) == 0.0
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(0.10)
+
+    def test_accumulates_across_too_thin_calls_until_it_clears_min_notional(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=0.01)
+        pl._grow_coin_reserve(state, "ladder2", 0.005, trader, filters, cfg)
+        assert state.coin_reserve_qty.get("ladder2", 0.0) == 0.0  # still too thin alone
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(0.005)
+        pl._grow_coin_reserve(state, "ladder2", 0.02, trader, filters, cfg)
+        assert state.coin_reserve_qty["ladder2"] > 0  # combined $0.025 clears min_notional
+        assert state.pending_coin_growth["ladder2"] == pytest.approx(0.0)
+
+
+class TestSplitProfitFourWays:
+    def test_equal_default_split(self):
+        cfg = make_cfg()  # 0.25 each
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=0.01)
+        pl._split_profit_four_ways(state, "ladder2", 1.0, trader, filters, cfg)
+        assert state.reserved_total == pytest.approx(0.25)
+        assert state.pending_reinvest_by_band[pl._band_key(0.04)] == pytest.approx(0.25)
+        assert state.ladder_reserved["ladder2"] == pytest.approx(0.25)
+        assert state.coin_reserve_qty.get("ladder2", 0.0) > 0 or state.pending_coin_growth.get("ladder2", 0.0) > 0
+
+    def test_custom_ratios(self):
+        cfg = make_cfg(accum_ratio=0.1, compound_ratio=0.4, ladder_reserve_ratio=0.3, coin_reserve_ratio=0.2)
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=0.01)
+        pl._split_profit_four_ways(state, "ladder2", 1.0, trader, filters, cfg)
+        assert state.reserved_total == pytest.approx(0.1)
+        assert state.pending_reinvest_by_band[pl._band_key(0.04)] == pytest.approx(0.4)
+        assert state.ladder_reserved["ladder2"] == pytest.approx(0.3)
+
+    def test_accumulation_is_bot_wide_not_per_ladder(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=0.01)
+        pl._split_profit_four_ways(state, "ladder1", 1.0, trader, filters, cfg)
+        pl._split_profit_four_ways(state, "ladder2", 1.0, trader, filters, cfg)
+        assert state.reserved_total == pytest.approx(0.5)  # 0.25 + 0.25, one shared total, not per-ladder
+
+    def test_zero_profit_is_a_no_op(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=0.01)
+        pl._split_profit_four_ways(state, "ladder2", 0.0, trader, filters, cfg)
+        assert state.reserved_total == 0.0
+        assert state.ladder_reserved == {}
+
+
+class TestReplenishCoinReserve:
+    def test_rebuys_from_principal(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=0.01)
+        refilled = pl.replenish_coin_reserve(state, "ladder2", 1.0, trader, filters, cfg)
+        assert refilled is True
+        assert state.coin_reserve_qty["ladder2"] > 0
+        assert state.coin_reserve_cost_basis["ladder2"] == pytest.approx(0.09 * 1.002)
+        assert len(trader.placed_buys) == 1
+
+    def test_zero_or_negative_principal_is_noop(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(), FakeFilters()
+        assert pl.replenish_coin_reserve(state, "ladder2", 0.0, trader, filters, cfg) is False
+        assert state.coin_reserve_qty == {}
+
+    def test_too_thin_returns_false_without_buying(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09), FakeFilters(min_notional=1000.0)
+        refilled = pl.replenish_coin_reserve(state, "ladder2", 1.0, trader, filters, cfg)
+        assert refilled is False
+        assert trader.placed_buys == []
+        assert state.coin_reserve_qty == {}
+
+    def test_buy_failure_returns_false(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=0.09, fail_buy=True), FakeFilters(min_notional=0.01)
+        refilled = pl.replenish_coin_reserve(state, "ladder2", 1.0, trader, filters, cfg)
+        assert refilled is False
+        assert state.coin_reserve_qty == {}
+
+
+class TestMaybeFundSellFromReserve:
+    def test_lists_reserve_when_ladder_has_zero_sells(self):
+        cfg = make_cfg(taker_avoidance_buffer=0.0005)
+        state = BotState(levels=[], coin_reserve_qty={"ladder1": 10.0},
+                          coin_reserve_cost_basis={"ladder1": 0.085})
+        trader, filters = FakeTrader(price=0.086), FakeFilters(min_notional=0.01)
+        listed = pl.maybe_fund_sell_from_reserve(state, 0.086, trader, filters, cfg)
+        assert listed == 1
+        assert len(state.levels) == 1
+        lvl = state.levels[0]
+        assert lvl.state == "sell_open"
+        assert lvl.from_coin_reserve is True
+        assert lvl.coin_reserve_ladder == "ladder1"
+        assert lvl.buy_price == 0.085
+        assert lvl.qty == 10.0
+        assert state.coin_reserve_qty["ladder1"] == 0.0
+        assert len(trader.placed_sells) == 1
+
+    def test_extends_sell_coverage_above_highest_when_ladder_already_has_a_live_sell(self):
+        cfg = make_cfg()
+        existing = GridLevel(index=1, buy_price=0.080, sell_price=0.080 * 1.02, base_qty=5.0,
+                              qty=5.0, state="sell_open")  # ladder1's own 2% gap, highest sell so far
+        state = BotState(levels=[existing], coin_reserve_qty={"ladder1": 10.0},
+                          coin_reserve_cost_basis={"ladder1": 0.085})
+        trader, filters = FakeTrader(price=0.086), FakeFilters(min_notional=0.01)
+        listed = pl.maybe_fund_sell_from_reserve(state, 0.086, trader, filters, cfg)
+        assert listed == 1
+        assert len(state.levels) == 2  # existing untouched, new one added
+        assert state.levels[0] is existing
+        new_lvl = state.levels[1]
+        assert new_lvl.sell_price > existing.sell_price  # strictly above the old highest
+        assert state.coin_reserve_qty["ladder1"] == 0.0  # reserve consumed
+
+    def test_noop_when_reserve_empty(self):
+        cfg = make_cfg()
+        state = BotState(levels=[], coin_reserve_qty={"ladder1": 0.0})
+        trader, filters = FakeTrader(), FakeFilters()
+        listed = pl.maybe_fund_sell_from_reserve(state, 0.086, trader, filters, cfg)
+        assert listed == 0
+        assert state.levels == []
+
+    def test_placement_failure_leaves_reserve_untouched(self):
+        cfg = make_cfg()
+        state = BotState(levels=[], coin_reserve_qty={"ladder1": 10.0},
+                          coin_reserve_cost_basis={"ladder1": 0.085})
+        trader, filters = FakeTrader(price=0.086, fail_sell=True), FakeFilters(min_notional=0.01)
+        listed = pl.maybe_fund_sell_from_reserve(state, 0.086, trader, filters, cfg)
+        assert listed == 0
+        assert state.levels == []
+        assert state.coin_reserve_qty["ladder1"] == 10.0  # not lost
+
+    def test_too_thin_to_clear_min_notional_leaves_reserve_untouched(self):
+        cfg = make_cfg()
+        state = BotState(levels=[], coin_reserve_qty={"ladder1": 0.01},
+                          coin_reserve_cost_basis={"ladder1": 0.085})
+        trader, filters = FakeTrader(price=0.086), FakeFilters(min_notional=1000.0)
+        listed = pl.maybe_fund_sell_from_reserve(state, 0.086, trader, filters, cfg)
+        assert listed == 0
+        assert state.coin_reserve_qty["ladder1"] == 0.01
+
+
+class TestLiquidateCoinReservePosition:
+    def test_profit_splits_and_principal_replenishes(self):
+        cfg = make_cfg()
+        state = BotState()
+        lvl = GridLevel(index=1, buy_price=0.085, sell_price=0.085 * 1.02, base_qty=10.0, qty=10.0,
+                         state="sell_open", from_coin_reserve=True, coin_reserve_ladder="ladder1")
+        profit = (lvl.sell_price - lvl.buy_price) * 10.0
+        trader, filters = FakeTrader(price=0.086), FakeFilters(min_notional=0.01)
+        refilled = pl.liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg)
+        assert refilled is True
+        assert state.ladder_reserved["ladder1"] == pytest.approx(profit * 0.25)
+        assert state.reserved_total == pytest.approx(profit * 0.25)
+        assert state.total_profit_realized == pytest.approx(profit)
+        assert state.coin_reserve_qty["ladder1"] > 0
+
+    def test_replenishment_failure_sends_principal_to_pending_reinvest(self):
+        cfg = make_cfg()
+        state = BotState()
+        lvl = GridLevel(index=1, buy_price=0.085, sell_price=0.085 * 1.02, base_qty=10.0, qty=10.0,
+                         state="sell_open", from_coin_reserve=True, coin_reserve_ladder="ladder1")
+        profit = (lvl.sell_price - lvl.buy_price) * 10.0
+        principal = 0.085 * 10.0
+        trader, filters = FakeTrader(price=0.086, fail_buy=True), FakeFilters(min_notional=0.01)
+        refilled = pl.liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg)
+        assert refilled is False
+        assert state.coin_reserve_qty == {}
+        expected_band = state.pending_reinvest_by_band[pl._band_key(0.02)]
+        assert expected_band == pytest.approx(profit * 0.25 + principal)
+
+    def test_ladder_identity_comes_from_the_level_not_the_gap(self):
+        cfg = make_cfg()
+        state = BotState()
+        lvl = GridLevel(index=1, buy_price=0.08, sell_price=0.10, base_qty=10.0, qty=10.0,
+                         state="sell_open", from_coin_reserve=True, coin_reserve_ladder="ladder1")
+        profit = (0.10 - 0.08) * 10.0
+        trader, filters = FakeTrader(price=0.099), FakeFilters(min_notional=0.01)
+        pl.liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg)
+        assert state.ladder_reserved.get("ladder1", 0.0) == pytest.approx(profit * 0.25)
+        assert state.ladder_reserved.get("ladder2", 0.0) == 0.0

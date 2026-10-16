@@ -62,21 +62,21 @@ def _exact_ladder_match(offset_pct: float, cfg):
     return None
 
 
-def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float, cfg) -> str:
+def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float, cfg, trader, filters) -> str:
     """Replaces reinvest.py's distribute_profit for the new ladder system:
-    reserve_ratio of profit goes into reserve, the remainder is queued as
-    pending_reinvest_by_band, picked up by reshape_ladder's future_pool on
-    its next cycle (reusing the existing gap-filling logic rather than
-    placing orders directly here).
+    every sale's profit is split 4 ways via _split_profit_four_ways --
+    bot-wide accumulation (never drawn), buy-side compounding, this
+    ladder's own USD reserve (still auto-drawable), and this ladder's own
+    coin reserve.
 
-    A position whose gap EXACTLY matches one of the 3 ladders (a real rung
+    A position whose gap EXACTLY matches one of the 5 ladders (a real rung
     of that ladder) has its ENTIRE profit routed to that one ladder, as
     always.
 
     A position whose gap matches NONE of them -- a legacy position held
     over from the OLD single-dense-zone design (the 7 positions at ~4.6%,
     i.e. DENSE_SELL_OFFSET/DENSE_LOW, ~$25 cost basis total) -- has its
-    profit SPLIT EVENLY across all 3 ladders instead of funneling to
+    profit SPLIT EVENLY across all 5 ladders instead of funneling to
     whichever is merely closest (previously ladder2's 4%). Same fix applied
     to XRP's 5-ladder version 2026-10-08 after it was found there that
     "nearest ladder" routing would starve the other ladders; applied here
@@ -93,27 +93,15 @@ def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float,
     exact_name = _exact_ladder_match(sold_offset_pct, cfg)
 
     if exact_name is not None:
-        reserve_amount = profit * cfg.profit_reserve_ratio
-        distribute_amount = profit - reserve_amount
-        state.ladder_reserved[exact_name] = state.ladder_reserved.get(exact_name, 0.0) + reserve_amount
-        state.ladder_reserved_contributed[exact_name] = state.ladder_reserved_contributed.get(exact_name, 0.0) + reserve_amount
-        band_key = _band_key(sold_offset_pct)
-        state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + distribute_amount
-        log.info(f"pct_ladder: profit {profit:.4f} attributed to {exact_name} (exact offset match) -- "
-                 f"{reserve_amount:.4f} to its own reserve (now ${state.ladder_reserved[exact_name]:.4f}), "
-                 f"{distribute_amount:.4f} queued for its next reshape")
+        _split_profit_four_ways(state, exact_name, profit, trader, filters, cfg)
         return exact_name
 
     share = profit / len(specs)
     for _, ladder_offset_pct, _, name in specs:
-        reserve_amount = share * cfg.profit_reserve_ratio
-        distribute_amount = share - reserve_amount
-        state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_amount
-        state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_amount
-        band_key = _band_key(ladder_offset_pct)
-        state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + distribute_amount
+        _split_profit_four_ways(state, name, share, trader, filters, cfg)
     log.info(f"pct_ladder: profit {profit:.4f} from a legacy position (offset {sold_offset_pct:.4f}, "
-             f"no exact ladder match) -- split evenly across all {len(specs)} ladders (${share:.4f} each before reserve split)")
+             f"no exact ladder match) -- split evenly across all {len(specs)} ladders (${share:.4f} each, "
+             f"see per-ladder log lines above)")
     return "legacy-even-split"
 
 
@@ -453,6 +441,230 @@ def extend_ladder_coverage(state, name, step_pct, offset_pct, cfg, filters):
     log.info(f"pct_ladder: {name} extended coverage downward with {len(fresh)} new rung(s) "
              f"(${reserve_draw:.4f} from reserve), lowest now ${min(l.buy_price for l in fresh):.6f}")
     return len(fresh)
+
+
+def maybe_fund_sell_from_reserve(state, current_price, trader, filters, cfg):
+    """Runs every poll cycle, after maybe_reshape_ladders. A ladder can only
+    ever have something to sell once one of its own buy rungs has actually
+    filled -- unlike the buy side, there's no reserve a ladder can draw on
+    to conjure up a sell order, because a sell order requires actually
+    owning the coin. replenish_coin_reserve (below) keeps
+    state.coin_reserve_qty stocked with a standing, unlisted amount of coin
+    per ladder precisely for this.
+
+    Two cases, same underlying mechanic:
+    - Zero live sells of its own: lists the reserve at its natural price
+      (cost_basis * (1 + offset_pct)) so the ladder is never left with
+      nothing to offer just because price hasn't dipped into its window yet.
+    - Already has live sells: still lists the reserve as soon as there's
+      enough of it to clear min_notional, priced just above whatever
+      currently sits highest -- extending real sell coverage upward over
+      time as the reserve regrows (mirrors extend_ladder_coverage's
+      downward growth on the buy side), instead of sitting on it until the
+      ladder goes completely dry. Either way, never touches or rebuilds an
+      existing sell order.
+
+    Cheap no-op in the common case (empty reserve)."""
+    from grid import GridLevel
+
+    listed = 0
+    for step_pct, offset_pct, _, name in ladder_specs(cfg):
+        qty = state.coin_reserve_qty.get(name, 0.0)
+        if qty <= 0:
+            continue
+
+        own_sells = [lvl for lvl in state.levels
+                     if lvl.state == "sell_open" and lvl.buy_price > 0
+                     and abs((lvl.sell_price / lvl.buy_price - 1.0) - offset_pct) < OFFSET_TOLERANCE_PCT]
+
+        cost_basis = state.coin_reserve_cost_basis.get(name, 0.0)
+        round_qty = filters.round_qty(qty)
+        if cost_basis <= 0 or round_qty <= 0:
+            continue
+
+        # Fresh price right before placing, same reasoning apply_order_window
+        # uses for buys: the cycle's current_price may already be a few
+        # seconds stale by the time we get here.
+        fresh_price = trader.get_price()
+        natural_price = cost_basis * (1.0 + offset_pct)
+        if own_sells:
+            highest_sell = max(lvl.sell_price for lvl in own_sells)
+            natural_price = max(natural_price, highest_sell * (1.0 + step_pct))
+        sell_price = filters.round_price(max(natural_price, fresh_price + cfg.taker_avoidance_buffer))
+        if round_qty * sell_price < filters.min_notional:
+            log.warning(f"pct_ladder: {name} coin reserve ({round_qty} @ ~${sell_price:.6f}) too thin "
+                        f"to clear min_notional -- left untouched")
+            continue
+
+        try:
+            order_id = trader.place_limit_sell(sell_price, round_qty)
+        except Exception as exc:
+            log.warning(f"pct_ladder: {name} coin-reserve sell placement failed ({exc}) -- "
+                        f"reserve left untouched, will retry next cycle")
+            continue
+
+        new_lvl = GridLevel(index=state.next_level_index, buy_price=cost_basis, sell_price=sell_price,
+                             base_qty=round_qty, qty=round_qty, state="sell_open",
+                             sell_order_id=order_id, from_coin_reserve=True, coin_reserve_ladder=name)
+        state.next_level_index += 1
+        state.levels.append(new_lvl)
+        state.coin_reserve_qty[name] = 0.0
+        listed += 1
+        if own_sells:
+            log.info(f"pct_ladder: {name} extended sell coverage upward with its coin reserve "
+                     f"({round_qty} @ ${sell_price:.6f}), above previous highest ${highest_sell:.6f}")
+        else:
+            log.info(f"pct_ladder: {name} had zero live sells of its own -- listed its coin reserve "
+                     f"({round_qty} @ ${sell_price:.6f}, cost basis ${cost_basis:.6f}) as a real sell order")
+    return listed
+
+
+def replenish_coin_reserve(state, name, amount, trader, filters, cfg):
+    """Buys more of this ladder's coin_reserve_qty[name] with `amount` USD
+    -- same immediate-fill technique DASH's bulk ladder uses (a limit buy
+    placed slightly ABOVE current price on purpose, to cross the spread and
+    fill now rather than rest and wait).
+    Two callers, two purposes:
+    - liquidate_coin_reserve_position: `amount` = a just-sold reserve
+      position's own principal, closing the loop back to its original
+      seeded size (replenishment).
+    - _grow_coin_reserve: `amount` = a slice of ordinary profit
+      reinvestment (cfg.coin_reserve_ratio), permanently GROWING the
+      reserve beyond its original seed size over time, gradually, across
+      every ladder-native/legacy/reserve sale -- not just restoring it.
+    Either way this never touches the ladder's buying power or its own
+    USD reserve pool.
+
+    Returns True if the buy succeeded, False otherwise -- the caller is
+    responsible for routing `amount` somewhere safe instead (e.g.
+    pending_reinvest_by_band) on a False return. This function never
+    discards capital itself, it only reports whether it could put it to
+    use. No synchronous fill verification here -- same lighter-weight,
+    already-proven pattern DASH's bulk ladder uses for its own
+    immediate-fill purchase, since this runs unattended on every
+    qualifying sale rather than as a manually-reviewed script."""
+    if amount <= 0:
+        return False
+    fresh_price = trader.get_price()
+    buy_price = filters.round_price(fresh_price * 1.002)
+    qty = filters.round_qty(amount / buy_price) if buy_price > 0 else 0.0
+    if qty <= 0 or qty * buy_price < filters.min_notional:
+        log.warning(f"pct_ladder: {name} coin-reserve buy amount (${amount:.4f}) too thin to "
+                    f"clear min_notional -- skipped this cycle")
+        return False
+    try:
+        trader.place_limit_buy(buy_price, qty)
+    except Exception as exc:
+        log.warning(f"pct_ladder: {name} coin-reserve buy failed ({exc}) -- reserve not grown")
+        return False
+    old_qty = state.coin_reserve_qty.get(name, 0.0)
+    old_cost_basis = state.coin_reserve_cost_basis.get(name, 0.0)
+    new_qty = old_qty + qty
+    # Weighted average, not a plain overwrite -- matters once coin-reserve growth
+    # can call this repeatedly while the reserve is ALREADY nonzero (gradual
+    # growth from many small profit events), not just the old draw-then-
+    # replenish case where it always started at exactly zero.
+    state.coin_reserve_cost_basis[name] = (
+        (old_qty * old_cost_basis + qty * buy_price) / new_qty if new_qty > 0 else buy_price)
+    state.coin_reserve_qty[name] = new_qty
+    log.info(f"pct_ladder: {name} coin reserve grew -- bought {qty} @ ${buy_price:.6f} "
+             f"(${qty * buy_price:.4f} of ${amount:.4f}), now {new_qty} @ avg "
+             f"${state.coin_reserve_cost_basis[name]:.6f}")
+    return True
+
+
+def _grow_coin_reserve(state, name, coin_amount, trader, filters, cfg):
+    """Buys coin with this ladder's already-sized coin-reserve slice of a
+    sale's profit (cfg.coin_reserve_ratio of it -- sizing now happens
+    once, in _split_profit_four_ways, not here).
+
+    A single sale's slice is usually far too small to clear min_notional
+    on its own (found live 2026-10-13 on XRP, same pct_ladder design: 48
+    of 52 attempts since this feature went live had been silently
+    skipped). Rather than discarding that opportunity each time, the slice
+    ACCUMULATES in state.pending_coin_growth[name] across sales until the
+    running total is big enough to actually clear min_notional, then
+    resets to zero."""
+    if coin_amount <= 0:
+        return
+    pending = state.pending_coin_growth.get(name, 0.0) + coin_amount
+    if replenish_coin_reserve(state, name, pending, trader, filters, cfg):
+        state.pending_coin_growth[name] = 0.0
+    else:
+        state.pending_coin_growth[name] = pending
+
+
+def _split_profit_four_ways(state, name, profit, trader, filters, cfg):
+    """Splits a ladder-attributed profit amount 4 ways (ratios configurable,
+    must sum to 1.0 -- see config.py's validate()):
+    - cfg.accum_ratio -> state.reserved_total, bot-wide, never auto-drawn
+      by anything.
+    - cfg.compound_ratio -> this ladder's pending_reinvest_by_band (today's
+      existing buy-side compounding, picked up by reshape_ladder).
+    - cfg.ladder_reserve_ratio -> this ladder's own state.ladder_reserved --
+      still auto-drawable via _draw_from_ladder_reserve, unchanged from
+      today's behavior.
+    - cfg.coin_reserve_ratio -> this ladder's own coin reserve, via
+      _grow_coin_reserve."""
+    if profit <= 0:
+        return
+    accum_amount = profit * cfg.accum_ratio
+    compound_amount = profit * cfg.compound_ratio
+    reserve_amount = profit * cfg.ladder_reserve_ratio
+    coin_amount = profit * cfg.coin_reserve_ratio
+
+    state.reserved_total += accum_amount
+
+    band_key = _band_key(next(o for _, o, _, n in ladder_specs(cfg) if n == name))
+    state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + compound_amount
+
+    state.ladder_reserved[name] = state.ladder_reserved.get(name, 0.0) + reserve_amount
+    state.ladder_reserved_contributed[name] = state.ladder_reserved_contributed.get(name, 0.0) + reserve_amount
+
+    _grow_coin_reserve(state, name, coin_amount, trader, filters, cfg)
+
+    log.info(f"pct_ladder: {name} profit {profit:.4f} split 4 ways -- "
+             f"${accum_amount:.4f} accumulation (never drawn, bot total now ${state.reserved_total:.4f}), "
+             f"${compound_amount:.4f} buy-side compounding, "
+             f"${reserve_amount:.4f} to its own reserve (now ${state.ladder_reserved[name]:.4f}), "
+             f"${coin_amount:.4f} toward coin reserve")
+
+
+def liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg) -> bool:
+    """Called from bot.py's sell-fill loop when a from_coin_reserve=True
+    level sells. Routes profit directly to lvl.coin_reserve_ladder -- the
+    ladder recorded explicitly on the level itself, NOT re-derived from the
+    sell/buy gap, since the taker-avoidance floor in
+    maybe_fund_sell_from_reserve can make that gap land slightly wider than
+    the ladder's exact offset_pct (which would otherwise misroute via
+    distribute_profit_ladder_aware's own offset matching). The caller is
+    responsible for removing the level from state.levels -- this function
+    only handles capital.
+
+    The sale's PRINCIPAL (separate from its profit) replenishes the coin
+    reserve back toward its pre-sale size. Its PROFIT goes through the
+    same 4-way split as any other sale (_split_profit_four_ways) -- so a
+    reserve position's profit can grow the coin reserve FURTHER, on top of
+    the principal already restoring it.
+
+    Returns True if the coin reserve was successfully replenished from this
+    sale's principal."""
+    name = lvl.coin_reserve_ladder
+    principal = lvl.buy_price * lvl.qty
+    profit = max(0.0, profit)
+    state.total_profit_realized += profit
+
+    refilled = replenish_coin_reserve(state, name, principal, trader, filters, cfg)
+    if not refilled:
+        band_key = _band_key(next(o for _, o, _, n in ladder_specs(cfg) if n == name))
+        state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + principal
+
+    _split_profit_four_ways(state, name, profit, trader, filters, cfg)
+
+    log.info(f"pct_ladder: {name} coin-reserve position liquidated -- principal ${principal:.4f} "
+             + ("replenished the reserve" if refilled else "queued to pending-reinvest (replenishment failed)")
+             + f", profit ${profit:.4f} split 4 ways (see line above)")
+    return refilled
 
 
 def maybe_reshape_ladders(state, current_price, trader, filters, cfg):

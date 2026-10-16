@@ -11,7 +11,8 @@ from dense_window import maybe_shift_dense_window
 from grid import GridLevel, build_bulk_ladder_levels, build_hybrid_zoned_levels, build_zoned_levels
 from health import write_heartbeat
 from ledger import log_buy_fill, log_sell_fill
-from pct_ladder import distribute_profit_ladder_aware, ladder_specs, maybe_reshape_ladders
+from pct_ladder import (distribute_profit_ladder_aware, ladder_specs, liquidate_coin_reserve_position,
+                        maybe_fund_sell_from_reserve, maybe_reshape_ladders)
 from reinvest import distribute_profit, retry_pending_reinvest
 from sell_fanout import merge_same_price_buys, merge_same_price_sells, place_fanout
 from state import BotState, load_state, save_state
@@ -326,17 +327,42 @@ def run():
                             log.info(f"Grid {lvl.index} (${lvl.buy_price}): SELL filled "
                                       f"qty={lvl.qty} profit={profit:.4f} USDT"
                                       + (" [one_shot, closing for good]" if lvl.one_shot else ""))
-                            reserved_amount = profit * cfg.profit_reserve_ratio
+                            # Ledger only has 2 split columns (reserved/distributed); the real
+                            # split is 4-way now for ladder-native sales (see
+                            # _split_profit_four_ways) -- reserved_usdt here is just the
+                            # ladder-reserve_ratio slice (still auto-drawable, same meaning as
+                            # before), distributed_usdt is everything else (accumulation +
+                            # compounding + coin reserve combined). Full per-bucket amounts
+                            # are in the pct_ladder log line and state.json.
+                            reserved_amount = profit * (cfg.ladder_reserve_ratio
+                                                         if cfg.pct_ladder_enabled and not lvl.one_shot
+                                                         else cfg.profit_reserve_ratio)
                             log_sell_fill(cfg.ledger_file, lvl.index, lvl.buy_price, lvl.sell_price,
                                           lvl.qty, profit, reserved_amount, profit - reserved_amount,
                                           lvl.one_shot, cfg.dry_run)
+
+                            if lvl.from_coin_reserve:
+                                # Checked BEFORE the normal pct_ladder/legacy
+                                # routing on purpose: a reserve-funded sell's
+                                # gap can land slightly wider than its
+                                # ladder's exact offset_pct (the
+                                # taker-avoidance floor in
+                                # maybe_fund_sell_from_reserve can win over
+                                # the natural cost_basis*(1+offset_pct) price
+                                # if HBAR rose since seeding), which would
+                                # otherwise misfire the normal/legacy-split
+                                # routing instead of replenishment.
+                                liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg)
+                                levels_to_remove.append(lvl)
+                                continue
+
                             lvl.state = "closed" if lvl.one_shot else "idle"
                             lvl.buy_order_id = None
                             lvl.sell_order_id = None
                             lvl.qty = 0.0
                             if cfg.pct_ladder_enabled and not lvl.one_shot:
                                 sold_offset_pct = (lvl.sell_price / lvl.buy_price - 1.0) if lvl.buy_price else 0.0
-                                distribute_profit_ladder_aware(state, profit, sold_offset_pct, cfg)
+                                distribute_profit_ladder_aware(state, profit, sold_offset_pct, cfg, trader, filters)
                             else:
                                 distribute_profit(state, profit, current_price,
                                                    cfg.profit_reserve_ratio, trader, filters,
@@ -368,6 +394,8 @@ def run():
                 maybe_shift_dense_window(state, current_price, trader, filters, cfg)
 
                 maybe_reshape_ladders(state, current_price, trader, filters, cfg)
+
+                maybe_fund_sell_from_reserve(state, current_price, trader, filters, cfg)
 
                 apply_order_window(state, current_price, trader, filters, cfg.max_open_orders,
                                     cfg.taker_avoidance_buffer, halted=halted)
