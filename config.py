@@ -72,6 +72,7 @@ class Config:
     ladder5_window_pct: float
     reserved_draw_floor_pct: float      # each draw capped so a ladder's own reserve never drops below this fraction of itself
     reserved_topup_threshold_usd: float  # a ladder's own (idle+buy_open) capital below this triggers an auto top-up from its reserve
+    extend_min_free_balance_usd: float  # extend_ladder_coverage skips the whole cycle (all 5 ladders) when free quote-asset balance is below this -- throttle so it doesn't race other bots/ladders for the same shared exchange balance
     # Every ladder-native sale's profit splits 4 ways (must sum to 1.0) --
     # see pct_ladder.py's _split_profit_four_ways. accum_ratio is the only
     # one of the four never auto-drawn by anything; ladder_reserve_ratio
@@ -145,6 +146,7 @@ def load_config() -> Config:
         ladder5_window_pct=float(_get("LADDER5_WINDOW_PCT", "0.50")),
         reserved_draw_floor_pct=float(_get("RESERVED_DRAW_FLOOR_PCT", "0.5")),
         reserved_topup_threshold_usd=float(_get("RESERVED_TOPUP_THRESHOLD_USD", "20.0")),
+        extend_min_free_balance_usd=float(_get("EXTEND_MIN_FREE_BALANCE_USD", "15.0")),
         accum_ratio=float(_get("ACCUM_RATIO", "0.25")),
         compound_ratio=float(_get("COMPOUND_RATIO", "0.25")),
         ladder_reserve_ratio=float(_get("LADDER_RESERVE_RATIO", "0.25")),
@@ -220,6 +222,8 @@ def load_config() -> Config:
         raise RuntimeError("RESERVED_DRAW_FLOOR_PCT must be between 0 and 1")
     if cfg.reserved_topup_threshold_usd < 0:
         raise RuntimeError("RESERVED_TOPUP_THRESHOLD_USD must be zero or positive")
+    if cfg.extend_min_free_balance_usd < 0:
+        raise RuntimeError("EXTEND_MIN_FREE_BALANCE_USD must be zero or positive")
     for name in ("accum_ratio", "compound_ratio", "ladder_reserve_ratio", "coin_reserve_ratio"):
         val = getattr(cfg, name)
         if not (0.0 <= val <= 1.0):

@@ -676,11 +676,26 @@ def maybe_reshape_ladders(state, current_price, trader, filters, cfg):
     if not cfg.pct_ladder_enabled:
         return 0
     zones = compute_ladder_zones(current_price, cfg)
+    # extend_ladder_coverage (2026-10-15) draws real exchange balance every
+    # cycle, across all 5 ladders -- on bots sharing a tight free-balance
+    # pool with another bot (e.g. XRP+UNI's USD) it can drain faster than
+    # the pool refills, leaving unrelated new buy orders rejected for
+    # insufficient balance. One balance check per cycle (not per ladder)
+    # gates the whole batch; reshape_ladder's own gap-filling is unaffected
+    # since it only ever resizes/fills within the existing window.
+    quote_asset = "USDT" if cfg.symbol.endswith("USDT") else "USD"
+    free_balance = trader.get_free_balance(quote_asset)
+    extend_allowed = free_balance >= cfg.extend_min_free_balance_usd
+    if not extend_allowed:
+        log.info(f"pct_ladder: skipping extend_ladder_coverage this cycle -- "
+                 f"free {quote_asset} balance ${free_balance:.2f} below "
+                 f"EXTEND_MIN_FREE_BALANCE_USD ${cfg.extend_min_free_balance_usd:.2f}")
     total_reshaped = 0
     for step_pct, offset_pct, window_pct, name in ladder_specs(cfg):
         lo, hi = zones[name]
         if hi <= lo:
             continue
         total_reshaped += reshape_ladder(state, name, lo, hi, step_pct, offset_pct, trader, filters, cfg, current_price)
-        total_reshaped += extend_ladder_coverage(state, name, step_pct, offset_pct, cfg, filters)
+        if extend_allowed:
+            total_reshaped += extend_ladder_coverage(state, name, step_pct, offset_pct, cfg, filters)
     return total_reshaped

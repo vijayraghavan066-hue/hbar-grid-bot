@@ -90,6 +90,15 @@ class BinanceUSTrader:
         ticker = self._client.get_symbol_ticker(symbol=self.symbol)
         return float(ticker["price"])
 
+    def get_free_balance(self, asset: str) -> float:
+        """Free (non-locked) balance of one asset. Dry-run has no real
+        account to check, so it always reports plenty -- sim orders never
+        need to be throttled by balance."""
+        if self.dry_run:
+            return float("inf")
+        bal = self._client.get_asset_balance(asset=asset)
+        return float(bal["free"]) if bal else 0.0
+
     def place_limit_buy(self, price: float, qty: float) -> str:
         if self.dry_run:
             order_id = f"SIM-BUY-{uuid.uuid4().hex[:10]}"
