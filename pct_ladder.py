@@ -573,6 +573,53 @@ def replenish_coin_reserve(state, name, amount, trader, filters, cfg):
     return True
 
 
+def maybe_protect_profit(state, protect_trader, protect_filters):
+    """Converts state.pending_protect (accum_ratio's share of every sale's
+    profit -- see _split_profit_four_ways) into cfg.protect_symbol, a
+    stablecoin (e.g. USDCUSDT) that none of this project's bots trade.
+    This is the only thing that actually removes money from the shared
+    exchange balance every bot draws on -- state.reserved_total was always
+    just a bookkeeping label, never a real withdrawal from what this bot's
+    own order placement (or any other bot sharing the account) could still
+    spend. Requested explicitly 2026-10-21 after confirming "protected"
+    profit was never actually safe from being redeployed.
+
+    Same immediate-fill technique as replenish_coin_reserve (a limit buy
+    placed 0.2% above current price, to cross the spread and fill now
+    rather than rest and wait). A single profit-split's accum share is
+    almost always far too small to clear the protect symbol's own
+    min_notional/lot-size on its own, so this accumulates across many
+    cycles (same pattern as pending_coin_growth) until there's enough to
+    actually place the buy. Called once per poll cycle, independent of
+    any particular sale -- a placement failure just leaves pending_protect
+    untouched for a retry next cycle, never worse off than before.
+
+    Returns the USD amount actually converted this cycle (0 if nothing
+    happened)."""
+    if state.pending_protect <= 0:
+        return 0.0
+    price = protect_trader.get_price()
+    if price <= 0:
+        return 0.0
+    buy_price = protect_filters.round_price(price * 1.002)
+    qty = protect_filters.round_qty(state.pending_protect / buy_price) if buy_price > 0 else 0.0
+    if qty <= 0 or qty * buy_price < protect_filters.min_notional:
+        return 0.0
+    try:
+        protect_trader.place_limit_buy(buy_price, qty)
+    except Exception as exc:
+        log.warning(f"pct_ladder: protect-profit buy of {qty} {protect_trader.symbol} failed "
+                     f"({exc}) -- ${state.pending_protect:.4f} left pending, retry next cycle")
+        return 0.0
+    spent = qty * buy_price
+    state.pending_protect = max(0.0, state.pending_protect - spent)
+    state.protected_total += spent
+    log.info(f"pct_ladder: protected ${spent:.4f} -- bought {qty} {protect_trader.symbol} @ "
+              f"${buy_price:.6f} (bot total protected now ${state.protected_total:.4f}, "
+              f"${state.pending_protect:.4f} still pending)")
+    return spent
+
+
 def _grow_coin_reserve(state, name, coin_amount, trader, filters, cfg):
     """Buys coin with this ladder's already-sized coin-reserve slice of a
     sale's profit (cfg.coin_reserve_ratio of it -- sizing now happens
@@ -614,6 +661,7 @@ def _split_profit_four_ways(state, name, profit, trader, filters, cfg):
     coin_amount = profit * cfg.coin_reserve_ratio
 
     state.reserved_total += accum_amount
+    state.pending_protect += accum_amount
 
     band_key = _band_key(next(o for _, o, _, n in ladder_specs(cfg) if n == name))
     state.pending_reinvest_by_band[band_key] = state.pending_reinvest_by_band.get(band_key, 0.0) + compound_amount

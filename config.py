@@ -40,6 +40,7 @@ class Config:
     bulk_sell_high: float
     bulk_sell_step: float
     max_open_orders: int
+    protect_symbol: str  # stablecoin pair (e.g. USDCUSDT/USDCUSD) used to convert accum_ratio profit out of the shared exchange balance for real
     taker_avoidance_buffer: float
     zone_shift_enabled: bool
     zone_shift_interval_hours: float
@@ -116,6 +117,7 @@ def load_config() -> Config:
         bulk_sell_high=float(_get("BULK_SELL_HIGH", "100.0")),
         bulk_sell_step=float(_get("BULK_SELL_STEP", "0.25")),
         max_open_orders=int(_get("MAX_OPEN_ORDERS", "180")),
+        protect_symbol=_get("PROTECT_SYMBOL", "USDCUSDT"),
         taker_avoidance_buffer=float(_get("TAKER_AVOIDANCE_BUFFER", "0.30")),
         zone_shift_enabled=_get_bool("ZONE_SHIFT_ENABLED", True),
         zone_shift_interval_hours=float(_get("ZONE_SHIFT_INTERVAL_HOURS", "2")),
@@ -188,6 +190,10 @@ def load_config() -> Config:
                             "(Binance.US caps open orders per symbol at 200)")
     if cfg.taker_avoidance_buffer < 0:
         raise RuntimeError("TAKER_AVOIDANCE_BUFFER must be zero or positive")
+    if not cfg.protect_symbol or not cfg.protect_symbol.startswith("USDC"):
+        raise RuntimeError("PROTECT_SYMBOL must be a USDC pair (e.g. USDCUSDT, USDCUSD) -- "
+                            "the whole point is converting into an asset none of this "
+                            "project's bots trade, and USDC is the only one checked for this")
     if cfg.zone_shift_interval_hours <= 0:
         raise RuntimeError("ZONE_SHIFT_INTERVAL_HOURS must be positive")
     if not (0.0 < cfg.near_market_band_pct < 1.0):

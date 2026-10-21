@@ -12,7 +12,7 @@ from grid import GridLevel, build_bulk_ladder_levels, build_hybrid_zoned_levels,
 from health import write_heartbeat
 from ledger import log_buy_fill, log_sell_fill
 from pct_ladder import (distribute_profit_ladder_aware, ladder_specs, liquidate_coin_reserve_position,
-                        maybe_fund_sell_from_reserve, maybe_reshape_ladders)
+                        maybe_fund_sell_from_reserve, maybe_protect_profit, maybe_reshape_ladders)
 from reinvest import distribute_profit, retry_pending_reinvest
 from sell_fanout import merge_same_price_buys, merge_same_price_sells, place_fanout
 from state import BotState, load_state, save_state
@@ -145,6 +145,14 @@ def run():
 
     trader = BinanceUSTrader(cfg.api_key, cfg.api_secret, cfg.symbol, cfg.dry_run)
     filters = trader.get_symbol_filters()
+
+    # Separate trader/filters for cfg.protect_symbol (e.g. USDCUSDT) --
+    # deliberately not cfg.symbol's own trader, since the whole point of
+    # protect_profit is converting into something this bot (and every
+    # other bot sharing the same Binance.US account) never otherwise
+    # touches. Same API key, same account, just a different market.
+    protect_trader = BinanceUSTrader(cfg.api_key, cfg.api_secret, cfg.protect_symbol, cfg.dry_run)
+    protect_filters = protect_trader.get_symbol_filters()
 
     current_signature = {
         "symbol": cfg.symbol,
@@ -399,6 +407,9 @@ def run():
 
                 apply_order_window(state, current_price, trader, filters, cfg.max_open_orders,
                                     cfg.taker_avoidance_buffer, halted=halted)
+
+                if not halted:
+                    maybe_protect_profit(state, protect_trader, protect_filters)
 
                 save_state(cfg.state_file, state)
                 consecutive_errors = 0

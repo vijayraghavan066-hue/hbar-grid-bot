@@ -35,7 +35,8 @@ def make_cfg(**overrides):
 
 class FakeTrader:
     def __init__(self, fail_cancel_ids=None, price=0.09, fail_buy=False, fail_sell=False,
-                 free_balance=1_000_000.0):
+                 free_balance=1_000_000.0, symbol="USDCUSDT"):
+        self.symbol = symbol
         self.cancelled = []
         self.fail_cancel_ids = fail_cancel_ids or set()
         self.price = price
@@ -898,3 +899,85 @@ class TestLiquidateCoinReservePosition:
         pl.liquidate_coin_reserve_position(state, lvl, profit, trader, filters, cfg)
         assert state.ladder_reserved.get("ladder1", 0.0) == pytest.approx(profit * 0.25)
         assert state.ladder_reserved.get("ladder2", 0.0) == 0.0
+
+
+class TestMaybeProtectProfit:
+    """maybe_protect_profit converts state.pending_protect into cfg.protect_symbol
+    (a stablecoin, e.g. USDCUSDT) that this bot never otherwise trades -- the real
+    mechanism that removes accum_ratio's profit share from the shared exchange
+    balance, added 2026-10-21 after confirming reserved_total alone never actually
+    protected anything from being redeployed by this bot's own order placement."""
+
+    def test_split_profit_four_ways_feeds_pending_protect(self):
+        cfg = make_cfg()
+        state = BotState()
+        trader, filters = FakeTrader(price=1.40), FakeFilters(min_notional=1.0)
+        pl._split_profit_four_ways(state, "ladder1", 100.0, trader, filters, cfg)
+        # accum_ratio=0.25 of 100 -> both reserved_total (unchanged bookkeeping)
+        # AND pending_protect (the new, real mechanism) get the same 25.0 share.
+        assert state.reserved_total == pytest.approx(25.0)
+        assert state.pending_protect == pytest.approx(25.0)
+
+    def test_noop_when_nothing_pending(self):
+        state = BotState(pending_protect=0.0)
+        trader = FakeTrader(price=1.0)
+        filters = FakeFilters(min_notional=1.0)
+        spent = pl.maybe_protect_profit(state, trader, filters)
+        assert spent == 0.0
+        assert trader.placed_buys == []
+
+    def test_too_small_to_clear_min_notional_stays_pending(self):
+        # $0.50 pending, USDC price ~$1 -> well under a $1 min_notional.
+        state = BotState(pending_protect=0.50)
+        trader = FakeTrader(price=1.0001, symbol="USDCUSDT")
+        filters = FakeFilters(min_notional=1.0)
+        spent = pl.maybe_protect_profit(state, trader, filters)
+        assert spent == 0.0
+        assert trader.placed_buys == []
+        assert state.pending_protect == pytest.approx(0.50)  # untouched, retried next cycle
+        assert state.protected_total == 0.0
+
+    def test_enough_pending_triggers_a_real_buy_above_market(self):
+        # $12 pending clears a $1 min_notional easily.
+        state = BotState(pending_protect=12.0)
+        trader = FakeTrader(price=1.0000, symbol="USDCUSDT")
+        filters = FakeFilters(min_notional=1.0)
+        spent = pl.maybe_protect_profit(state, trader, filters)
+        assert len(trader.placed_buys) == 1
+        buy_price, qty = trader.placed_buys[0]
+        # 0.2% above market, same immediate-fill convention as replenish_coin_reserve.
+        assert buy_price == pytest.approx(1.002)
+        assert qty > 0
+        assert spent == pytest.approx(qty * buy_price)
+        assert state.protected_total == pytest.approx(spent)
+        # Only what was actually spent leaves pending_protect -- any
+        # remainder (lot-size rounding dust) stays queued, not discarded.
+        # abs= tolerance since the real value is clamped to exactly 0.0 by
+        # max(0.0, ...) while 12.0 - spent can land a hair negative first.
+        assert state.pending_protect == pytest.approx(12.0 - spent, abs=1e-6)
+
+    def test_placement_failure_leaves_pending_protect_untouched(self):
+        state = BotState(pending_protect=12.0)
+        trader = FakeTrader(price=1.0, symbol="USDCUSDT", fail_buy=True)
+        filters = FakeFilters(min_notional=1.0)
+        spent = pl.maybe_protect_profit(state, trader, filters)
+        assert spent == 0.0
+        assert state.pending_protect == pytest.approx(12.0)
+        assert state.protected_total == 0.0
+
+    def test_accumulates_across_multiple_calls_before_clearing(self):
+        # Three separate $0.25 contributions (well under a $1 min_notional
+        # each) should accumulate rather than each being silently dropped.
+        state = BotState()
+        trader = FakeTrader(price=1.0, symbol="USDCUSDT")
+        filters = FakeFilters(min_notional=1.0)
+        for _ in range(3):
+            state.pending_protect += 0.25
+            pl.maybe_protect_profit(state, trader, filters)
+        assert trader.placed_buys == []  # $0.75 total still under the $1 min_notional
+        assert state.pending_protect == pytest.approx(0.75)
+        # A 4th contribution pushes it over the $1 min_notional -> converts.
+        state.pending_protect += 0.40
+        pl.maybe_protect_profit(state, trader, filters)
+        assert len(trader.placed_buys) == 1
+        assert state.protected_total > 0

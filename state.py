@@ -47,6 +47,19 @@ class BotState:
     # per ladder across sales instead of being discarded back to buy-side
     # every time, until the running total is big enough to actually buy.
     pending_coin_growth: dict = field(default_factory=dict)      # name -> USD accumulated, not yet converted to coin
+    # accum_ratio's share used to just sit in reserved_total forever --
+    # bookkeeping only, never actually removed from the shared exchange
+    # balance every bot draws on, so it was never genuinely "protected"
+    # from being spent by this bot's own order placement (or any other
+    # bot sharing the same account). pending_protect accumulates that same
+    # share until it's enough to really buy cfg.protect_symbol (a
+    # stablecoin none of this project's bots trade), at which point it
+    # leaves the shared pool for real. protected_total is the all-time
+    # running total of USD actually converted this way (never decrements) --
+    # separate from reserved_total, which still tracks the full accum_ratio
+    # history as pure bookkeeping, unchanged.
+    pending_protect: float = 0.0
+    protected_total: float = 0.0
 
     def to_dict(self):
         return {
@@ -71,6 +84,8 @@ class BotState:
             "coin_reserve_qty": self.coin_reserve_qty,
             "coin_reserve_cost_basis": self.coin_reserve_cost_basis,
             "pending_coin_growth": self.pending_coin_growth,
+            "pending_protect": self.pending_protect,
+            "protected_total": self.protected_total,
         }
 
     @staticmethod
@@ -99,6 +114,8 @@ class BotState:
             coin_reserve_qty=d.get("coin_reserve_qty", {}),
             coin_reserve_cost_basis=d.get("coin_reserve_cost_basis", {}),
             pending_coin_growth=d.get("pending_coin_growth", {}),
+            pending_protect=d.get("pending_protect", 0.0),
+            protected_total=d.get("protected_total", 0.0),
         )
 
 
