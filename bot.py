@@ -11,7 +11,8 @@ from dense_window import maybe_shift_dense_window
 from grid import GridLevel, build_bulk_ladder_levels, build_hybrid_zoned_levels, build_zoned_levels
 from health import write_heartbeat
 from ledger import log_buy_fill, log_sell_fill
-from pct_ladder import (distribute_profit_ladder_aware, ladder_specs, liquidate_coin_reserve_position,
+from pct_ladder import (is_self_compound_rung, self_compound_profit,
+                        distribute_profit_ladder_aware, ladder_specs, liquidate_coin_reserve_position,
                         maybe_fund_sell_from_reserve, maybe_protect_profit, maybe_reshape_ladders)
 from reinvest import distribute_profit, retry_pending_reinvest
 from sell_fanout import merge_same_price_buys, merge_same_price_sells, place_fanout
@@ -342,7 +343,7 @@ def run():
                             # before), distributed_usdt is everything else (accumulation +
                             # compounding + coin reserve combined). Full per-bucket amounts
                             # are in the pct_ladder log line and state.json.
-                            reserved_amount = profit * (cfg.ladder_reserve_ratio
+                            reserved_amount = 0.0 if is_self_compound_rung(lvl, cfg) else profit * (cfg.ladder_reserve_ratio
                                                          if cfg.pct_ladder_enabled and not lvl.one_shot
                                                          else cfg.profit_reserve_ratio)
                             log_sell_fill(cfg.ledger_file, lvl.index, lvl.buy_price, lvl.sell_price,
@@ -368,7 +369,9 @@ def run():
                             lvl.buy_order_id = None
                             lvl.sell_order_id = None
                             lvl.qty = 0.0
-                            if cfg.pct_ladder_enabled and not lvl.one_shot:
+                            if is_self_compound_rung(lvl, cfg):
+                                self_compound_profit(state, lvl, profit)
+                            elif cfg.pct_ladder_enabled and not lvl.one_shot:
                                 sold_offset_pct = (lvl.sell_price / lvl.buy_price - 1.0) if lvl.buy_price else 0.0
                                 distribute_profit_ladder_aware(state, profit, sold_offset_pct, cfg, trader, filters)
                             else:

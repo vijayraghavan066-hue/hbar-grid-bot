@@ -981,3 +981,63 @@ class TestMaybeProtectProfit:
         pl.maybe_protect_profit(state, trader, filters)
         assert len(trader.placed_buys) == 1
         assert state.protected_total > 0
+
+
+class TestSelfCompoundLadders2to5:
+    """Ladders 2-5: 100% of a rung's profit grows that same rung; Ladder 1,
+    bulk, coin-reserve and legacy sells keep their existing routing."""
+
+    @staticmethod
+    def rung(cfg, ladder_name, buy=1.0, qty=10.0, **kw):
+        off = next(o for _, o, _, n in pl.ladder_specs(cfg) if n == ladder_name)
+        return GridLevel(index=1, buy_price=buy, sell_price=buy * (1 + off), base_qty=qty, qty=qty, **kw)
+
+    def test_ladders_2_to_5_qualify_ladder_1_does_not(self):
+        cfg = make_cfg()
+        assert not pl.is_self_compound_rung(self.rung(cfg, "ladder1"), cfg)
+        for n in ("ladder2", "ladder3", "ladder4", "ladder5"):
+            assert pl.is_self_compound_rung(self.rung(cfg, n), cfg), n
+
+    def test_bulk_coin_reserve_legacy_and_disabled_do_not_qualify(self):
+        cfg = make_cfg()
+        assert not pl.is_self_compound_rung(self.rung(cfg, "ladder3", one_shot=True), cfg)
+        assert not pl.is_self_compound_rung(self.rung(cfg, "ladder3", from_coin_reserve=True), cfg)
+        legacy = GridLevel(index=2, buy_price=1.0, sell_price=1.2345, base_qty=5.0, qty=5.0)
+        assert not pl.is_self_compound_rung(legacy, cfg)
+        assert not pl.is_self_compound_rung(self.rung(cfg, "ladder3"), make_cfg(pct_ladder_enabled=False))
+
+    def test_profit_grows_only_that_rungs_extra_qty(self):
+        cfg = make_cfg()
+        lvl = self.rung(cfg, "ladder4", buy=2.0)
+        state = BotState(levels=[lvl])
+        before = (state.reserved_total, state.pending_protect, dict(state.pending_reinvest_by_band),
+                  dict(state.ladder_reserved), dict(state.coin_reserve_qty))
+        pl.self_compound_profit(state, lvl, 0.50)
+        assert lvl.extra_qty == pytest.approx(0.25) and lvl.target_qty() == pytest.approx(10.25)
+        assert lvl.last_reinvest_usd == 0.50 and lvl.last_reinvest_ts > 0
+        assert state.total_profit_realized == pytest.approx(0.50)
+        assert before == (state.reserved_total, state.pending_protect, dict(state.pending_reinvest_by_band),
+                          dict(state.ladder_reserved), dict(state.coin_reserve_qty))
+
+    def test_repeated_sales_accumulate_on_the_same_rung(self):
+        cfg = make_cfg()
+        lvl = self.rung(cfg, "ladder2", buy=1.0)
+        state = BotState(levels=[lvl])
+        pl.self_compound_profit(state, lvl, 0.10)
+        pl.self_compound_profit(state, lvl, 0.20)
+        assert lvl.extra_qty == pytest.approx(0.30) and state.total_profit_realized == pytest.approx(0.30)
+
+    def test_zero_or_negative_profit_is_a_no_op(self):
+        cfg = make_cfg()
+        lvl = self.rung(cfg, "ladder5")
+        state = BotState(levels=[lvl])
+        pl.self_compound_profit(state, lvl, 0.0)
+        pl.self_compound_profit(state, lvl, -1.0)
+        assert lvl.extra_qty == 0.0 and state.total_profit_realized == 0.0
+
+    def test_ladder_1_still_splits_four_ways(self):
+        cfg = make_cfg()
+        state = BotState()
+        pl.distribute_profit_ladder_aware(state, 1.0, next(o for _, o, _, n in pl.ladder_specs(cfg) if n == "ladder1"),
+                                           cfg, FakeTrader(), FakeFilters())
+        assert state.reserved_total == pytest.approx(cfg.accum_ratio)

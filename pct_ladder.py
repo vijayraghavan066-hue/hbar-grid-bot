@@ -105,6 +105,38 @@ def distribute_profit_ladder_aware(state, profit: float, sold_offset_pct: float,
     return "legacy-even-split"
 
 
+SELF_COMPOUND_LADDERS = ("ladder2", "ladder3", "ladder4", "ladder5")
+
+
+def is_self_compound_rung(lvl, cfg) -> bool:
+    """True for a real rung of Ladders 2-5 (gap EXACTLY matches that ladder's
+    offset_pct). Ladder 1, bulk, coin-reserve and legacy positions are not."""
+    if not cfg.pct_ladder_enabled or lvl.one_shot or lvl.from_coin_reserve or lvl.buy_price <= 0:
+        return False
+    return _exact_ladder_match(lvl.sell_price / lvl.buy_price - 1.0, cfg) in SELF_COMPOUND_LADDERS
+
+
+def self_compound_profit(state, lvl, profit: float) -> None:
+    """Ladders 2-5 only (2026-10-23, requested by Vivaan, same as DASH): 100%
+    of a rung's own profit grows that SAME rung's extra_qty -- no 4-way split,
+    no accum/ladder-reserve/coin-reserve growth and no USDC-protection share
+    from these four ladders any more. Ladder 1 keeps the 4-way split.
+
+    `lvl` is the level that just sold; the caller has already reset it to idle,
+    so apply_order_window re-arms it next cycle at the same buy price with the
+    larger target_qty(). total_profit_realized is incremented here because
+    this path bypasses distribute_profit_ladder_aware."""
+    if profit <= 0:
+        return
+    state.total_profit_realized += profit
+    lvl.extra_qty += profit / lvl.buy_price
+    lvl.last_reinvest_usd = profit
+    lvl.last_reinvest_ts = time.time()
+    log.info(f"pct_ladder: Grid {lvl.index} (${lvl.buy_price}): ladder2-5 self-compound -- "
+             f"${profit:.4f} profit grew this rung's own extra_qty to {lvl.extra_qty:.6f} "
+             f"(no split, no reserve/coin/USDC growth)")
+
+
 def ladder_specs(cfg):
     """(step_pct, offset_pct, window_pct, name) for ladders 1-5, in order.
     step_pct/offset_pct/window_pct are fractions (0.01 = 1%), not percent
